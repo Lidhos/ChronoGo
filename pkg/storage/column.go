@@ -26,6 +26,7 @@ const (
 	CompressionDictionary byte = 4 // 字典编码
 	CompressionRLE        byte = 5 // 游程编码
 	CompressionGorilla    byte = 6 // Gorilla压缩
+	CompressionAuto       byte = 7 // 自动选择最佳压缩方法
 )
 
 // Column 表示列存储
@@ -1032,6 +1033,965 @@ func (c *Column) Deserialize(data []byte) error {
 		}
 	default:
 		return fmt.Errorf("unsupported column type: %d", c.Type)
+	}
+
+	return nil
+}
+
+// BatchAddValues 批量添加值到列中
+func (c *Column) BatchAddValues(values []interface{}) error {
+	if len(values) == 0 {
+		return nil
+	}
+
+	// 预分配内存
+	newCount := c.Count + len(values)
+
+	// 根据列类型处理不同的数据
+	switch c.Type {
+	case ColumnTypeTimestamp:
+		// 时间戳列
+		timestamps := make([]int64, len(values))
+		for i, v := range values {
+			ts, ok := v.(int64)
+			if !ok {
+				return fmt.Errorf("value at index %d is not a timestamp", i)
+			}
+			timestamps[i] = ts
+		}
+
+		// 如果是第一批数据，直接存储
+		if c.Count == 0 {
+			c.Data = make([]byte, len(timestamps)*8)
+			for i, ts := range timestamps {
+				binary.LittleEndian.PutUint64(c.Data[i*8:], uint64(ts))
+			}
+		} else {
+			// 否则，扩展现有数据
+			newData := make([]byte, newCount*8)
+			copy(newData, c.Data)
+			for i, ts := range timestamps {
+				binary.LittleEndian.PutUint64(newData[(c.Count+i)*8:], uint64(ts))
+			}
+			c.Data = newData
+		}
+
+		// 更新最小值和最大值
+		if c.Count == 0 || timestamps[0] < int64(binary.LittleEndian.Uint64(c.Min)) {
+			c.Min = make([]byte, 8)
+			binary.LittleEndian.PutUint64(c.Min, uint64(timestamps[0]))
+		}
+		if c.Count == 0 || timestamps[len(timestamps)-1] > int64(binary.LittleEndian.Uint64(c.Max)) {
+			c.Max = make([]byte, 8)
+			binary.LittleEndian.PutUint64(c.Max, uint64(timestamps[len(timestamps)-1]))
+		}
+
+	case ColumnTypeFloat:
+		// 浮点数列
+		floats := make([]float64, len(values))
+		for i, v := range values {
+			f, ok := v.(float64)
+			if !ok {
+				return fmt.Errorf("value at index %d is not a float", i)
+			}
+			floats[i] = f
+		}
+
+		// 如果是第一批数据，直接存储
+		if c.Count == 0 {
+			c.Data = make([]byte, len(floats)*8)
+			for i, f := range floats {
+				binary.LittleEndian.PutUint64(c.Data[i*8:], math.Float64bits(f))
+			}
+		} else {
+			// 否则，扩展现有数据
+			newData := make([]byte, newCount*8)
+			copy(newData, c.Data)
+			for i, f := range floats {
+				binary.LittleEndian.PutUint64(newData[(c.Count+i)*8:], math.Float64bits(f))
+			}
+			c.Data = newData
+		}
+
+		// 更新最小值和最大值
+		minFloat := floats[0]
+		maxFloat := floats[0]
+		for _, f := range floats {
+			if f < minFloat {
+				minFloat = f
+			}
+			if f > maxFloat {
+				maxFloat = f
+			}
+		}
+
+		if c.Count == 0 || minFloat < math.Float64frombits(binary.LittleEndian.Uint64(c.Min)) {
+			c.Min = make([]byte, 8)
+			binary.LittleEndian.PutUint64(c.Min, math.Float64bits(minFloat))
+		}
+		if c.Count == 0 || maxFloat > math.Float64frombits(binary.LittleEndian.Uint64(c.Max)) {
+			c.Max = make([]byte, 8)
+			binary.LittleEndian.PutUint64(c.Max, math.Float64bits(maxFloat))
+		}
+
+	case ColumnTypeInteger:
+		// 整数列
+		integers := make([]int64, len(values))
+		for i, v := range values {
+			n, ok := v.(int64)
+			if !ok {
+				return fmt.Errorf("value at index %d is not an integer", i)
+			}
+			integers[i] = n
+		}
+
+		// 如果是第一批数据，直接存储
+		if c.Count == 0 {
+			c.Data = make([]byte, len(integers)*8)
+			for i, n := range integers {
+				binary.LittleEndian.PutUint64(c.Data[i*8:], uint64(n))
+			}
+		} else {
+			// 否则，扩展现有数据
+			newData := make([]byte, newCount*8)
+			copy(newData, c.Data)
+			for i, n := range integers {
+				binary.LittleEndian.PutUint64(newData[(c.Count+i)*8:], uint64(n))
+			}
+			c.Data = newData
+		}
+
+		// 更新最小值和最大值
+		minInt := integers[0]
+		maxInt := integers[0]
+		for _, n := range integers {
+			if n < minInt {
+				minInt = n
+			}
+			if n > maxInt {
+				maxInt = n
+			}
+		}
+
+		if c.Count == 0 || minInt < int64(binary.LittleEndian.Uint64(c.Min)) {
+			c.Min = make([]byte, 8)
+			binary.LittleEndian.PutUint64(c.Min, uint64(minInt))
+		}
+		if c.Count == 0 || maxInt > int64(binary.LittleEndian.Uint64(c.Max)) {
+			c.Max = make([]byte, 8)
+			binary.LittleEndian.PutUint64(c.Max, uint64(maxInt))
+		}
+
+	case ColumnTypeString:
+		// 字符串列 - 使用偏移量表示
+		offsets := make([]uint32, newCount+1)
+		if c.Count > 0 {
+			// 复制现有偏移量
+			for i := 0; i <= c.Count; i++ {
+				offsets[i] = binary.LittleEndian.Uint32(c.Data[i*4:])
+			}
+		} else {
+			offsets[0] = 0
+		}
+
+		// 计算新的字符串数据大小
+		totalLen := uint32(0)
+		if c.Count > 0 {
+			totalLen = binary.LittleEndian.Uint32(c.Data[c.Count*4:])
+		}
+
+		for _, v := range values {
+			s, ok := v.(string)
+			if !ok {
+				return fmt.Errorf("value is not a string")
+			}
+			totalLen += uint32(len(s))
+			offsets[c.Count+1] = totalLen
+			c.Count++
+		}
+
+		// 创建新的数据缓冲区
+		newData := make([]byte, int(uint32(newCount+1)*4+totalLen))
+
+		// 写入偏移量
+		for i := 0; i <= newCount; i++ {
+			binary.LittleEndian.PutUint32(newData[i*4:], offsets[i])
+		}
+
+		// 复制现有字符串数据
+		if c.Count > 0 {
+			oldDataStart := (c.Count + 1) * 4
+			oldDataLen := binary.LittleEndian.Uint32(c.Data[c.Count*4:])
+			copy(newData[(newCount+1)*4:], c.Data[oldDataStart:oldDataStart+int(oldDataLen)])
+		}
+
+		// 写入新的字符串数据
+		dataPos := (newCount + 1) * 4
+		for i, v := range values {
+			s := v.(string)
+			pos := dataPos + int(offsets[c.Count-len(values)+i])
+			copy(newData[pos:], s)
+		}
+
+		c.Data = newData
+		c.Count = newCount
+		return nil
+
+	case ColumnTypeBoolean:
+		// 布尔值列 - 使用位压缩
+		if c.Count == 0 {
+			c.Data = make([]byte, (len(values)+7)/8)
+		} else {
+			// 扩展数据缓冲区
+			newSize := (newCount + 7) / 8
+			if len(c.Data) < newSize {
+				newData := make([]byte, newSize)
+				copy(newData, c.Data)
+				c.Data = newData
+			}
+		}
+
+		// 写入新的布尔值
+		for i, v := range values {
+			b, ok := v.(bool)
+			if !ok {
+				return fmt.Errorf("value at index %d is not a boolean", i)
+			}
+
+			if b {
+				bytePos := (c.Count + i) / 8
+				bitPos := (c.Count + i) % 8
+				c.Data[bytePos] |= 1 << bitPos
+			}
+		}
+	}
+
+	c.Count = newCount
+	return nil
+}
+
+// BatchGetValues 批量获取列中的值
+func (c *Column) BatchGetValues(startIndex, count int) ([]interface{}, error) {
+	if startIndex < 0 || startIndex+count > c.Count {
+		return nil, fmt.Errorf("index out of range")
+	}
+
+	result := make([]interface{}, count)
+
+	switch c.Type {
+	case ColumnTypeTimestamp, ColumnTypeInteger:
+		// 时间戳和整数列
+		for i := 0; i < count; i++ {
+			idx := startIndex + i
+			offset := idx * 8
+			value := int64(binary.LittleEndian.Uint64(c.Data[offset:]))
+			result[i] = value
+		}
+
+	case ColumnTypeFloat:
+		// 浮点数列
+		for i := 0; i < count; i++ {
+			idx := startIndex + i
+			offset := idx * 8
+			bits := binary.LittleEndian.Uint64(c.Data[offset:])
+			result[i] = math.Float64frombits(bits)
+		}
+
+	case ColumnTypeString:
+		// 字符串列
+		for i := 0; i < count; i++ {
+			idx := startIndex + i
+			startOffset := binary.LittleEndian.Uint32(c.Data[idx*4:])
+			endOffset := binary.LittleEndian.Uint32(c.Data[(idx+1)*4:])
+			dataStart := (c.Count + 1) * 4
+
+			strBytes := c.Data[dataStart+int(startOffset) : dataStart+int(endOffset)]
+			result[i] = string(strBytes)
+		}
+
+	case ColumnTypeBoolean:
+		// 布尔值列
+		for i := 0; i < count; i++ {
+			idx := startIndex + i
+			bytePos := idx / 8
+			bitPos := idx % 8
+			result[i] = (c.Data[bytePos] & (1 << bitPos)) != 0
+		}
+	}
+
+	return result, nil
+}
+
+// CompressColumnAuto 自适应压缩，根据数据特性选择最佳压缩方法
+func (c *Column) CompressColumnAuto() error {
+	// 如果列为空，不需要压缩
+	if c.Count == 0 {
+		return nil
+	}
+
+	// 根据列类型选择合适的压缩算法
+	switch c.Type {
+	case ColumnTypeTimestamp:
+		return c.compressTimestampAuto()
+	case ColumnTypeFloat:
+		return c.compressFloatAuto()
+	case ColumnTypeInteger:
+		return c.compressIntegerAuto()
+	case ColumnTypeString:
+		return c.compressStringAuto()
+	case ColumnTypeBoolean:
+		// 布尔值已经使用位压缩，不需要额外压缩
+		c.Compression = CompressionNone
+		return nil
+	default:
+		return fmt.Errorf("unsupported column type: %d", c.Type)
+	}
+}
+
+// compressTimestampAuto 自适应压缩时间戳列
+func (c *Column) compressTimestampAuto() error {
+	// 提取时间戳数据
+	timestamps := make([]int64, c.Count)
+	for i := 0; i < c.Count; i++ {
+		val, err := c.GetValue(i)
+		if err != nil {
+			return err
+		}
+		timestamps[i] = val.(int64)
+	}
+
+	// 检查时间戳是否有规律的间隔
+	isRegular := true
+	if len(timestamps) > 2 {
+		delta := timestamps[1] - timestamps[0]
+		for i := 2; i < len(timestamps); i++ {
+			if timestamps[i]-timestamps[i-1] != delta {
+				isRegular = false
+				break
+			}
+		}
+	}
+
+	// 尝试不同的压缩方法并选择最佳的
+	var bestData []byte
+	var bestCompression byte
+	var minSize int = len(timestamps) * 8 // 原始大小
+
+	// 1. 尝试Delta-of-Delta编码
+	compressor1 := NewTimestampCompressor()
+	deltaDeltaData, err := compressor1.CompressDeltaDelta(timestamps)
+	if err == nil && len(deltaDeltaData) < minSize {
+		bestData = deltaDeltaData
+		bestCompression = CompressionDeltaDelta
+		minSize = len(deltaDeltaData)
+	}
+
+	// 2. 尝试Gorilla压缩
+	compressor2 := NewGorillaCompressor()
+	gorillaData, err := compressor2.CompressTimestamps(timestamps)
+	if err == nil && len(gorillaData) < minSize {
+		bestData = gorillaData
+		bestCompression = CompressionGorilla
+		minSize = len(gorillaData)
+	}
+
+	// 如果时间戳有规律间隔，Delta编码可能更好
+	if isRegular {
+		// 使用简单的Delta编码
+		deltaData := make([]byte, 8+len(timestamps)*4) // 第一个值(8字节) + 每个delta值(4字节)
+		binary.LittleEndian.PutUint64(deltaData[:8], uint64(timestamps[0]))
+
+		delta := timestamps[1] - timestamps[0]
+		binary.LittleEndian.PutUint32(deltaData[8:12], uint32(delta))
+
+		if len(deltaData) < minSize {
+			bestData = deltaData
+			bestCompression = CompressionDelta
+			minSize = len(deltaData)
+		}
+	}
+
+	// 更新列的压缩数据和压缩类型
+	if bestData != nil {
+		c.Data = bestData
+		c.Compression = bestCompression
+	}
+
+	return nil
+}
+
+// compressFloatAuto 自适应压缩浮点数列
+func (c *Column) compressFloatAuto() error {
+	// 提取浮点数据
+	floats := make([]float64, c.Count)
+	for i := 0; i < c.Count; i++ {
+		val, err := c.GetValue(i)
+		if err != nil {
+			return err
+		}
+		floats[i] = val.(float64)
+	}
+
+	// 检查数据特性
+	// 1. 计算数据的变化率
+	changeRates := make([]float64, len(floats)-1)
+	for i := 1; i < len(floats); i++ {
+		changeRates[i-1] = math.Abs(floats[i] - floats[i-1])
+	}
+
+	// 计算平均变化率
+	avgChangeRate := 0.0
+	for _, rate := range changeRates {
+		avgChangeRate += rate
+	}
+	if len(changeRates) > 0 {
+		avgChangeRate /= float64(len(changeRates))
+	}
+
+	// 2. 检查是否有大量重复值
+	valueCount := make(map[uint64]int)
+	for _, f := range floats {
+		bits := math.Float64bits(f)
+		valueCount[bits]++
+	}
+
+	// 计算唯一值的比例
+	uniqueRatio := float64(len(valueCount)) / float64(len(floats))
+
+	// 尝试不同的压缩方法并选择最佳的
+	var bestData []byte
+	var bestCompression byte
+	var minSize int = len(floats) * 8 // 原始大小
+
+	// 1. 尝试XOR编码 - 适合变化平缓的数据
+	if avgChangeRate < 1.0 {
+		compressor1 := NewFloatCompressor()
+		xorData, err := compressor1.CompressXOR(floats)
+		if err == nil && len(xorData) < minSize {
+			bestData = xorData
+			bestCompression = CompressionXOR
+			minSize = len(xorData)
+		}
+	}
+
+	// 2. 尝试Gorilla压缩 - 通常对时序数据效果好
+	compressor2 := NewGorillaCompressor()
+	gorillaData, err := compressor2.CompressFloats(floats)
+	if err == nil && len(gorillaData) < minSize {
+		bestData = gorillaData
+		bestCompression = CompressionGorilla
+		minSize = len(gorillaData)
+	}
+
+	// 3. 如果有大量重复值，考虑使用字典编码
+	if uniqueRatio < 0.1 { // 如果唯一值少于10%
+		// 创建字典
+		dict := make(map[uint64]int)
+		dictValues := make([]uint64, 0, len(valueCount))
+
+		for bits := range valueCount {
+			dict[bits] = len(dictValues)
+			dictValues = append(dictValues, bits)
+		}
+
+		// 编码数据
+		dictData := make([]byte, len(dictValues)*8)
+		for i, bits := range dictValues {
+			binary.LittleEndian.PutUint64(dictData[i*8:], bits)
+		}
+
+		// 创建索引
+		indexData := make([]byte, len(floats)*2) // 假设索引需要2字节
+		for i, f := range floats {
+			bits := math.Float64bits(f)
+			idx := dict[bits]
+			binary.LittleEndian.PutUint16(indexData[i*2:], uint16(idx))
+		}
+
+		// 合并字典和索引
+		dictLen := uint32(len(dictData))
+		indexLen := uint32(len(indexData))
+
+		dictCompressedData := make([]byte, 8+len(dictData)+len(indexData))
+		binary.LittleEndian.PutUint32(dictCompressedData[0:], dictLen)
+		binary.LittleEndian.PutUint32(dictCompressedData[4:], indexLen)
+		copy(dictCompressedData[8:], dictData)
+		copy(dictCompressedData[8+len(dictData):], indexData)
+
+		if len(dictCompressedData) < minSize {
+			bestData = indexData
+			c.DictionaryData = dictData
+			bestCompression = CompressionDictionary
+			minSize = len(dictCompressedData)
+		}
+	}
+
+	// 更新列的压缩数据和压缩类型
+	if bestData != nil {
+		c.Data = bestData
+		c.Compression = bestCompression
+	}
+
+	return nil
+}
+
+// compressIntegerAuto 自适应压缩整数列
+func (c *Column) compressIntegerAuto() error {
+	// 提取整数数据
+	integers := make([]int64, c.Count)
+	for i := 0; i < c.Count; i++ {
+		val, err := c.GetValue(i)
+		if err != nil {
+			return err
+		}
+		integers[i] = val.(int64)
+	}
+
+	// 检查数据特性
+	// 1. 计算数据范围
+	minVal := integers[0]
+	maxVal := integers[0]
+	for _, n := range integers {
+		if n < minVal {
+			minVal = n
+		}
+		if n > maxVal {
+			maxVal = n
+		}
+	}
+	dataRange := maxVal - minVal
+
+	// 2. 检查是否有大量重复值
+	valueCount := make(map[int64]int)
+	for _, n := range integers {
+		valueCount[n]++
+	}
+
+	// 计算唯一值的比例
+	uniqueRatio := float64(len(valueCount)) / float64(len(integers))
+
+	// 尝试不同的压缩方法并选择最佳的
+	var bestData []byte
+	var bestCompression byte
+	var minSize int = len(integers) * 8 // 原始大小
+
+	// 1. 尝试ZigZag编码 - 适合有符号整数
+	compressor1 := NewIntegerCompressor()
+	zigzagData, err := compressor1.CompressZigZag(integers)
+	if err == nil && len(zigzagData) < minSize {
+		bestData = zigzagData
+		bestCompression = CompressionDelta
+		minSize = len(zigzagData)
+	}
+
+	// 2. 如果数据范围小，考虑使用Delta编码
+	if dataRange < 1000 && len(integers) > 1 {
+		// 使用简单的Delta编码
+		deltaData := make([]byte, 8+len(integers)*4) // 第一个值(8字节) + 每个delta值(4字节)
+		binary.LittleEndian.PutUint64(deltaData[:8], uint64(integers[0]))
+
+		for i := 1; i < len(integers); i++ {
+			delta := integers[i] - integers[i-1]
+			binary.LittleEndian.PutUint32(deltaData[8+(i-1)*4:], uint32(delta))
+		}
+
+		if len(deltaData) < minSize {
+			bestData = deltaData
+			bestCompression = CompressionDelta
+			minSize = len(deltaData)
+		}
+	}
+
+	// 3. 如果有大量重复值，考虑使用字典编码
+	if uniqueRatio < 0.1 { // 如果唯一值少于10%
+		// 创建字典
+		dict := make(map[int64]int)
+		dictValues := make([]int64, 0, len(valueCount))
+
+		for n := range valueCount {
+			dict[n] = len(dictValues)
+			dictValues = append(dictValues, n)
+		}
+
+		// 编码数据
+		dictData := make([]byte, len(dictValues)*8)
+		for i, n := range dictValues {
+			binary.LittleEndian.PutUint64(dictData[i*8:], uint64(n))
+		}
+
+		// 创建索引
+		indexData := make([]byte, len(integers)*2) // 假设索引需要2字节
+		for i, n := range integers {
+			idx := dict[n]
+			binary.LittleEndian.PutUint16(indexData[i*2:], uint16(idx))
+		}
+
+		// 合并字典和索引
+		dictLen := uint32(len(dictData))
+		indexLen := uint32(len(indexData))
+
+		dictCompressedData := make([]byte, 8+len(dictData)+len(indexData))
+		binary.LittleEndian.PutUint32(dictCompressedData[0:], dictLen)
+		binary.LittleEndian.PutUint32(dictCompressedData[4:], indexLen)
+		copy(dictCompressedData[8:], dictData)
+		copy(dictCompressedData[8+len(dictData):], indexData)
+
+		if len(dictCompressedData) < minSize {
+			bestData = indexData
+			c.DictionaryData = dictData
+			bestCompression = CompressionDictionary
+			minSize = len(dictCompressedData)
+		}
+	}
+
+	// 更新列的压缩数据和压缩类型
+	if bestData != nil {
+		c.Data = bestData
+		c.Compression = bestCompression
+	}
+
+	return nil
+}
+
+// compressStringAuto 自适应压缩字符串列
+func (c *Column) compressStringAuto() error {
+	// 提取字符串数据
+	strings := make([]string, c.Count)
+	for i := 0; i < c.Count; i++ {
+		val, err := c.GetValue(i)
+		if err != nil {
+			return err
+		}
+		strings[i] = val.(string)
+	}
+
+	// 检查数据特性
+	// 1. 计算平均字符串长度
+	totalLen := 0
+	for _, s := range strings {
+		totalLen += len(s)
+	}
+	avgLen := float64(totalLen) / float64(len(strings))
+
+	// 2. 检查是否有大量重复值
+	valueCount := make(map[string]int)
+	for _, s := range strings {
+		valueCount[s]++
+	}
+
+	// 计算唯一值的比例
+	uniqueRatio := float64(len(valueCount)) / float64(len(strings))
+
+	// 3. 检查前缀重复情况
+	prefixCount := make(map[string]int)
+	if avgLen > 5 { // 只对较长的字符串检查前缀
+		for _, s := range strings {
+			if len(s) >= 3 {
+				prefix := s[:3]
+				prefixCount[prefix]++
+			}
+		}
+	}
+
+	// 找到最常见的前缀
+	var commonPrefix string
+	var maxCount int
+	for prefix, count := range prefixCount {
+		if count > maxCount {
+			maxCount = count
+			commonPrefix = prefix
+		}
+	}
+
+	// 计算前缀重复率
+	prefixRatio := float64(maxCount) / float64(len(strings))
+
+	// 尝试不同的压缩方法并选择最佳的
+	var bestData []byte
+	var bestDictData []byte
+	var bestCompression byte
+	var minSize int = totalLen + len(strings)*4 // 原始大小（假设每个字符串需要4字节的偏移量）
+
+	// 1. 尝试字典编码 - 适合有大量重复值的情况
+	if uniqueRatio < 0.5 { // 如果唯一值少于50%
+		compressor := NewStringCompressor()
+		dictData, indexData, err := compressor.CompressDictionary(strings)
+		if err == nil {
+			totalSize := len(dictData) + len(indexData)
+			if totalSize < minSize {
+				bestData = indexData
+				bestDictData = dictData
+				bestCompression = CompressionDictionary
+				minSize = totalSize
+			}
+		}
+	}
+
+	// 2. 如果有共同前缀，考虑前缀压缩
+	if prefixRatio > 0.5 && len(commonPrefix) > 0 {
+		// 简单的前缀压缩实现
+		prefixData := []byte(commonPrefix)
+		prefixLen := uint8(len(prefixData))
+
+		// 创建压缩数据
+		compressedData := make([]byte, 1+len(prefixData)+totalLen)
+		compressedData[0] = prefixLen
+		copy(compressedData[1:], prefixData)
+
+		// 写入每个字符串，如果以公共前缀开头则省略前缀
+		offset := 1 + len(prefixData)
+		for _, s := range strings {
+			if len(s) >= len(commonPrefix) && s[:len(commonPrefix)] == commonPrefix {
+				// 写入不带前缀的部分
+				suffix := s[len(commonPrefix):]
+				copy(compressedData[offset:], suffix)
+				offset += len(suffix)
+			} else {
+				// 写入完整字符串
+				copy(compressedData[offset:], s)
+				offset += len(s)
+			}
+			// 写入分隔符
+			compressedData[offset] = 0
+			offset++
+		}
+
+		// 截断到实际大小
+		compressedData = compressedData[:offset]
+
+		if len(compressedData) < minSize {
+			bestData = compressedData
+			bestCompression = CompressionRLE // 使用RLE类型表示前缀压缩
+			minSize = len(compressedData)
+		}
+	}
+
+	// 更新列的压缩数据和压缩类型
+	if bestData != nil {
+		c.Data = bestData
+		c.Compression = bestCompression
+		if bestCompression == CompressionDictionary {
+			c.DictionaryData = bestDictData
+		}
+	}
+
+	return nil
+}
+
+// CompressColumn 根据列类型选择最佳压缩算法压缩列数据
+func (c *Column) CompressColumn() error {
+	// 如果列为空，不需要压缩
+	if c.Count == 0 {
+		return nil
+	}
+
+	var compressedData []byte
+	var err error
+	var compressionType byte
+
+	switch c.Type {
+	case ColumnTypeTimestamp:
+		// 提取时间戳数据
+		timestamps := make([]int64, c.Count)
+		for i := 0; i < c.Count; i++ {
+			val, err := c.GetValue(i)
+			if err != nil {
+				return err
+			}
+			timestamps[i] = val.(int64)
+		}
+
+		// 使用Gorilla压缩
+		compressor := NewGorillaCompressor()
+		compressedData, err = compressor.CompressTimestamps(timestamps)
+		if err != nil {
+			return err
+		}
+		compressionType = CompressionGorilla
+
+	case ColumnTypeFloat:
+		// 提取浮点数据
+		floats := make([]float64, c.Count)
+		for i := 0; i < c.Count; i++ {
+			val, err := c.GetValue(i)
+			if err != nil {
+				return err
+			}
+			floats[i] = val.(float64)
+		}
+
+		// 使用XOR压缩
+		compressor := NewFloatCompressor()
+		compressedData, err = compressor.CompressXOR(floats)
+		if err != nil {
+			return err
+		}
+		compressionType = CompressionXOR
+
+	case ColumnTypeInteger:
+		// 提取整数数据
+		integers := make([]int64, c.Count)
+		for i := 0; i < c.Count; i++ {
+			val, err := c.GetValue(i)
+			if err != nil {
+				return err
+			}
+			integers[i] = val.(int64)
+		}
+
+		// 使用ZigZag编码
+		compressor := NewIntegerCompressor()
+		compressedData, err = compressor.CompressZigZag(integers)
+		if err != nil {
+			return err
+		}
+		compressionType = CompressionDelta
+
+	case ColumnTypeString:
+		// 提取字符串数据
+		strings := make([]string, c.Count)
+		for i := 0; i < c.Count; i++ {
+			val, err := c.GetValue(i)
+			if err != nil {
+				return err
+			}
+			strings[i] = val.(string)
+		}
+
+		// 使用字典编码
+		compressor := NewStringCompressor()
+		dictData, indexData, err := compressor.CompressDictionary(strings)
+		if err != nil {
+			return err
+		}
+
+		// 保存字典数据
+		c.DictionaryData = dictData
+		compressedData = indexData
+		compressionType = CompressionDictionary
+
+	case ColumnTypeBoolean:
+		// 布尔值已经使用位压缩，不需要额外压缩
+		compressedData = c.Data
+		compressionType = CompressionNone
+	}
+
+	// 更新列的压缩数据和压缩类型
+	c.Data = compressedData
+	c.Compression = compressionType
+
+	return nil
+}
+
+// DecompressColumn 解压缩列数据
+func (c *Column) DecompressColumn() error {
+	// 如果列为空或未压缩，不需要解压缩
+	if c.Count == 0 || c.Compression == CompressionNone {
+		return nil
+	}
+
+	var decompressedData []byte
+
+	switch c.Type {
+	case ColumnTypeTimestamp:
+		if c.Compression == CompressionGorilla {
+			// 使用Gorilla解压缩
+			compressor := NewGorillaCompressor()
+			timestamps, err := compressor.DecompressTimestamps(c.Data, c.Count)
+			if err != nil {
+				return err
+			}
+
+			// 将解压缩的时间戳转换为字节
+			decompressedData = make([]byte, c.Count*8)
+			for i, ts := range timestamps {
+				binary.LittleEndian.PutUint64(decompressedData[i*8:], uint64(ts))
+			}
+		} else if c.Compression == CompressionDeltaDelta {
+			// 使用Delta-of-Delta解压缩
+			compressor := NewTimestampCompressor()
+			timestamps, err := compressor.DecompressDeltaDelta(c.Data, c.Count)
+			if err != nil {
+				return err
+			}
+
+			// 将解压缩的时间戳转换为字节
+			decompressedData = make([]byte, c.Count*8)
+			for i, ts := range timestamps {
+				binary.LittleEndian.PutUint64(decompressedData[i*8:], uint64(ts))
+			}
+		}
+
+	case ColumnTypeFloat:
+		if c.Compression == CompressionXOR {
+			// 使用XOR解压缩
+			compressor := NewFloatCompressor()
+			floats, err := compressor.DecompressXOR(c.Data, c.Count)
+			if err != nil {
+				return err
+			}
+
+			// 将解压缩的浮点数转换为字节
+			decompressedData = make([]byte, c.Count*8)
+			for i, f := range floats {
+				binary.LittleEndian.PutUint64(decompressedData[i*8:], math.Float64bits(f))
+			}
+		}
+
+	case ColumnTypeInteger:
+		if c.Compression == CompressionDelta {
+			// 使用ZigZag解压缩
+			compressor := NewIntegerCompressor()
+			integers, err := compressor.DecompressZigZag(c.Data)
+			if err != nil {
+				return err
+			}
+
+			// 将解压缩的整数转换为字节
+			decompressedData = make([]byte, c.Count*8)
+			for i, n := range integers {
+				binary.LittleEndian.PutUint64(decompressedData[i*8:], uint64(n))
+			}
+		}
+
+	case ColumnTypeString:
+		if c.Compression == CompressionDictionary {
+			// 使用字典解压缩
+			compressor := NewStringCompressor()
+			strings, err := compressor.DecompressDictionary(c.DictionaryData, c.Data)
+			if err != nil {
+				return err
+			}
+
+			// 将解压缩的字符串转换为偏移量格式
+			totalLen := 0
+			for _, s := range strings {
+				totalLen += len(s)
+			}
+
+			decompressedData = make([]byte, (c.Count+1)*4+totalLen)
+			offset := uint32(0)
+
+			// 写入偏移量
+			for i, s := range strings {
+				binary.LittleEndian.PutUint32(decompressedData[i*4:], offset)
+				offset += uint32(len(s))
+			}
+			binary.LittleEndian.PutUint32(decompressedData[c.Count*4:], offset)
+
+			// 写入字符串数据
+			dataStart := (c.Count + 1) * 4
+			for i, s := range strings {
+				startOffset := binary.LittleEndian.Uint32(decompressedData[i*4:])
+				copy(decompressedData[dataStart+int(startOffset):], s)
+			}
+		}
+	}
+
+	// 更新列的数据和压缩类型
+	if decompressedData != nil {
+		c.Data = decompressedData
+		c.Compression = CompressionNone
 	}
 
 	return nil
