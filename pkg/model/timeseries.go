@@ -40,8 +40,28 @@ type Schema struct {
 
 // RetentionPolicy 表示数据保留策略
 type RetentionPolicy struct {
-	Duration  time.Duration // 数据保留时长
-	Precision string        // 时间精度(ns, us, ms, s)
+	Duration   time.Duration      // 数据保留时长
+	Precision  string             // 时间精度(ns, us, ms, s)
+	Downsample []DownsamplePolicy // 降采样策略
+}
+
+// DownsamplePolicy 表示降采样策略
+type DownsamplePolicy struct {
+	Interval    time.Duration // 降采样间隔
+	Function    string        // 降采样函数: "avg", "sum", "min", "max", "count", "first", "last"
+	Retention   time.Duration // 降采样数据保留时长
+	Destination string        // 降采样数据存储目标，空表示存储在原表中
+}
+
+// StorageTier 表示存储层级
+type StorageTier struct {
+	Name      string        // 层级名称
+	Type      string        // 存储类型: "memory", "ssd", "hdd", "s3", "gcs", "azure"
+	Priority  int           // 优先级，数字越小优先级越高
+	MaxAge    time.Duration // 数据在此层级的最大存储时间
+	ReadOnly  bool          // 是否只读
+	Compress  bool          // 是否压缩
+	BatchSize int           // 批处理大小
 }
 
 // TagIndex 表示标签索引

@@ -1,9 +1,12 @@
 package storage
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -21,16 +24,18 @@ import (
 
 // StorageEngine 表示时序存储引擎
 type StorageEngine struct {
-	dataDir     string                     // 数据目录
-	walDir      string                     // WAL目录
-	metaDir     string                     // 元数据目录
-	databases   map[string]*model.Database // 数据库映射
-	memTables   map[string]*MemTable       // 内存表映射 (db:table -> memtable)
-	wal         *WAL                       // 预写日志
-	indexMgr    index.IndexManager         // 索引管理器
-	flushTicker *time.Ticker               // 刷盘定时器
-	mu          sync.RWMutex               // 读写锁
-	closing     chan struct{}              // 关闭信号
+	dataDir      string                     // 数据目录
+	walDir       string                     // WAL目录
+	metaDir      string                     // 元数据目录
+	coldDir      string                     // 冷数据目录
+	databases    map[string]*model.Database // 数据库映射
+	memTables    map[string]*MemTable       // 内存表映射 (db:table -> memtable)
+	wal          *WAL                       // 预写日志
+	indexMgr     index.IndexManager         // 索引管理器
+	flushTicker  *time.Ticker               // 刷盘定时器
+	storageTiers []model.StorageTier        // 存储层级
+	mu           sync.RWMutex               // 读写锁
+	closing      chan struct{}              // 关闭信号
 }
 
 // QueryOptimizer 查询优化器
@@ -50,8 +55,9 @@ func NewStorageEngine(baseDir string) (*StorageEngine, error) {
 	dataDir := filepath.Join(baseDir, "data")
 	walDir := filepath.Join(baseDir, "wal")
 	metaDir := filepath.Join(baseDir, "meta")
+	coldDir := filepath.Join(baseDir, "cold")
 
-	for _, dir := range []string{dataDir, walDir, metaDir} {
+	for _, dir := range []string{dataDir, walDir, metaDir, coldDir} {
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			return nil, fmt.Errorf("failed to create directory %s: %w", dir, err)
 		}
@@ -66,15 +72,48 @@ func NewStorageEngine(baseDir string) (*StorageEngine, error) {
 	// 创建索引管理器
 	indexMgr := index.NewIndexManager()
 
+	// 定义默认存储层级
+	defaultTiers := []model.StorageTier{
+		{
+			Name:      "hot",
+			Type:      "memory",
+			Priority:  1,
+			MaxAge:    24 * time.Hour,
+			ReadOnly:  false,
+			Compress:  false,
+			BatchSize: 1000,
+		},
+		{
+			Name:      "warm",
+			Type:      "ssd",
+			Priority:  2,
+			MaxAge:    7 * 24 * time.Hour,
+			ReadOnly:  false,
+			Compress:  true,
+			BatchSize: 10000,
+		},
+		{
+			Name:      "cold",
+			Type:      "hdd",
+			Priority:  3,
+			MaxAge:    30 * 24 * time.Hour,
+			ReadOnly:  true,
+			Compress:  true,
+			BatchSize: 50000,
+		},
+	}
+
 	engine := &StorageEngine{
-		dataDir:   dataDir,
-		walDir:    walDir,
-		metaDir:   metaDir,
-		databases: make(map[string]*model.Database),
-		memTables: make(map[string]*MemTable),
-		wal:       wal,
-		indexMgr:  indexMgr,
-		closing:   make(chan struct{}),
+		dataDir:      dataDir,
+		walDir:       walDir,
+		metaDir:      metaDir,
+		coldDir:      coldDir,
+		databases:    make(map[string]*model.Database),
+		memTables:    make(map[string]*MemTable),
+		wal:          wal,
+		indexMgr:     indexMgr,
+		storageTiers: defaultTiers,
+		closing:      make(chan struct{}),
 	}
 
 	// 加载元数据
@@ -87,7 +126,7 @@ func NewStorageEngine(baseDir string) (*StorageEngine, error) {
 		return nil, fmt.Errorf("failed to recover from WAL: %w", err)
 	}
 
-	// 启动后台刷盘任务
+	// 启动后台任务
 	engine.startBackgroundTasks()
 
 	return engine, nil
@@ -250,13 +289,25 @@ func (e *StorageEngine) recoverFromWAL() error {
 // startBackgroundTasks 启动后台任务
 func (e *StorageEngine) startBackgroundTasks() {
 	e.flushTicker = time.NewTicker(1 * time.Minute)
+	retentionTicker := time.NewTicker(1 * time.Hour)     // 每小时检查一次数据保留
+	downsampleTicker := time.NewTicker(10 * time.Minute) // 每10分钟执行一次降采样
+	tierMigrationTicker := time.NewTicker(2 * time.Hour) // 每2小时执行一次数据迁移
 
 	go func() {
 		for {
 			select {
 			case <-e.flushTicker.C:
 				e.flushMemTables()
+			case <-retentionTicker.C:
+				e.enforceRetentionPolicies()
+			case <-downsampleTicker.C:
+				e.performDownsampling()
+			case <-tierMigrationTicker.C:
+				e.migrateDataBetweenTiers()
 			case <-e.closing:
+				retentionTicker.Stop()
+				downsampleTicker.Stop()
+				tierMigrationTicker.Stop()
 				return
 			}
 		}
@@ -528,108 +579,59 @@ func (e *StorageEngine) InsertPoint(dbName, tableName string, point *model.TimeS
 func (e *StorageEngine) QueryByTimeRange(dbName, tableName string, start, end int64) ([]*model.TimeSeriesPoint, error) {
 	// 检查数据库和表是否存在
 	e.mu.RLock()
-	db, dbExists := e.databases[dbName]
-	if !dbExists {
+	db, exists := e.databases[dbName]
+	if !exists {
 		e.mu.RUnlock()
-		return nil, fmt.Errorf("database %s does not exist", dbName)
+		return nil, fmt.Errorf("database %s not found", dbName)
 	}
 
-	_, tableExists := db.Tables[tableName]
-	if !tableExists {
+	_, exists = db.Tables[tableName]
+	if !exists {
 		e.mu.RUnlock()
-		return nil, fmt.Errorf("table %s does not exist in database %s", tableName, dbName)
+		return nil, fmt.Errorf("table %s not found in database %s", tableName, dbName)
 	}
 	e.mu.RUnlock()
 
-	// 创建查询优化器
-	optimizer := NewQueryOptimizer(e)
-
-	// 创建时间范围
-	timeRange := &TimeRange{
-		Start: start,
-		End:   end,
+	// 查询内存表
+	key := dbName + ":" + tableName
+	var memPoints []*model.TimeSeriesPoint
+	e.mu.RLock()
+	if memTable, exists := e.memTables[key]; exists {
+		memPoints = memTable.QueryByTimeRange(start, end)
 	}
+	e.mu.RUnlock()
 
-	// 选择最佳索引
-	ctx := context.Background()
-	indexName, err := optimizer.SelectBestIndex(ctx, dbName, tableName, nil, timeRange)
+	// 查询热存储
+	hotPoints, err := e.queryTierByTimeRange(dbName, tableName, "hot", start, end)
 	if err != nil {
-		// 索引选择失败，使用全表扫描
-		memTable, err := e.getOrCreateMemTable(dbName, tableName)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get memtable: %w", err)
-		}
-		return memTable.QueryByTimeRange(start, end), nil
+		return nil, fmt.Errorf("failed to query hot tier: %w", err)
 	}
 
-	// 获取选定的索引
-	selectedIndex, err := e.indexMgr.GetIndex(ctx, dbName, tableName, indexName)
+	// 查询温存储
+	warmPoints, err := e.queryTierByTimeRange(dbName, tableName, "warm", start, end)
 	if err != nil {
-		// 索引获取失败，使用全表扫描
-		memTable, err := e.getOrCreateMemTable(dbName, tableName)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get memtable: %w", err)
-		}
-		return memTable.QueryByTimeRange(start, end), nil
+		return nil, fmt.Errorf("failed to query warm tier: %w", err)
 	}
 
-	// 使用索引进行范围查询
-	var seriesIDs []string
-	if indexName == "time_idx" {
-		// 时间索引
-		seriesIDs, err = selectedIndex.SearchRange(ctx, start, end, true, true)
-	} else {
-		// 其他索引，可能需要额外的过滤
-		// 这里简化处理，实际应该根据索引类型和字段进行适当的查询
-		condition := index.IndexCondition{
-			Field:    "timestamp",
-			Operator: "between",
-			Value:    []int64{start, end},
-		}
-		seriesIDs, err = selectedIndex.Search(ctx, condition)
-	}
-
-	if err != nil || len(seriesIDs) == 0 {
-		// 索引查询失败或无结果，使用全表扫描
-		memTable, err := e.getOrCreateMemTable(dbName, tableName)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get memtable: %w", err)
-		}
-		return memTable.QueryByTimeRange(start, end), nil
-	}
-
-	// 获取内存表
-	memTable, err := e.getOrCreateMemTable(dbName, tableName)
+	// 查询冷存储
+	coldPoints, err := e.queryTierByTimeRange(dbName, tableName, "cold", start, end)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get memtable: %w", err)
+		return nil, fmt.Errorf("failed to query cold tier: %w", err)
 	}
 
-	// 使用索引结果查询
-	result := make([]*model.TimeSeriesPoint, 0, len(seriesIDs))
-	for _, id := range seriesIDs {
-		// 从seriesID中提取时间戳
-		parts := strings.Split(id, ":")
-		if len(parts) != 3 {
-			continue
-		}
+	// 合并结果
+	allPoints := make([]*model.TimeSeriesPoint, 0, len(memPoints)+len(hotPoints)+len(warmPoints)+len(coldPoints))
+	allPoints = append(allPoints, memPoints...)
+	allPoints = append(allPoints, hotPoints...)
+	allPoints = append(allPoints, warmPoints...)
+	allPoints = append(allPoints, coldPoints...)
 
-		// 尝试解析时间戳
-		ts, err := strconv.ParseInt(parts[2], 10, 64)
-		if err != nil {
-			continue
-		}
+	// 按时间戳排序
+	sort.Slice(allPoints, func(i, j int) bool {
+		return allPoints[i].Timestamp < allPoints[j].Timestamp
+	})
 
-		// 查询内存表
-		point, found := memTable.Get(ts)
-		if found && point != nil {
-			// 验证时间范围
-			if point.Timestamp >= start && point.Timestamp <= end {
-				result = append(result, point)
-			}
-		}
-	}
-
-	return result, nil
+	return allPoints, nil
 }
 
 // QueryByTag 按标签查询
@@ -1246,4 +1248,591 @@ func (qo *QueryOptimizer) SelectBestIndex(ctx context.Context, dbName, tableName
 	})
 
 	return scores[0].name, nil
+}
+
+// enforceRetentionPolicies 执行数据保留策略
+func (e *StorageEngine) enforceRetentionPolicies() {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	now := time.Now()
+	for dbName, db := range e.databases {
+		// 跳过没有保留策略的数据库
+		if db.RetentionPolicy.Duration <= 0 {
+			continue
+		}
+
+		// 计算保留边界时间
+		retentionBoundary := now.Add(-db.RetentionPolicy.Duration)
+		retentionTimestamp := retentionBoundary.UnixNano()
+
+		// 对每个表执行保留策略
+		for tableName := range db.Tables {
+			go func(dbName, tableName string, retentionTimestamp int64) {
+				if err := e.purgeExpiredData(dbName, tableName, retentionTimestamp); err != nil {
+					fmt.Printf("Error purging expired data for %s.%s: %v\n", dbName, tableName, err)
+				}
+			}(dbName, tableName, retentionTimestamp)
+		}
+	}
+}
+
+// purgeExpiredData 清理过期数据
+func (e *StorageEngine) purgeExpiredData(dbName, tableName string, retentionTimestamp int64) error {
+	// 获取表的磁盘存储路径
+	tablePath := filepath.Join(e.dataDir, dbName, tableName)
+
+	// 获取所有数据文件
+	files, err := os.ReadDir(tablePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // 目录不存在，无需清理
+		}
+		return fmt.Errorf("failed to read table directory: %w", err)
+	}
+
+	// 遍历数据文件，删除过期的文件
+	for _, file := range files {
+		if file.IsDir() {
+			continue // 跳过子目录
+		}
+
+		// 解析文件名，获取时间范围
+		// 假设文件名格式为: data_<startTime>_<endTime>.tsdb
+		parts := strings.Split(file.Name(), "_")
+		if len(parts) != 3 || !strings.HasSuffix(parts[2], ".tsdb") {
+			continue // 跳过不符合命名规则的文件
+		}
+
+		// 只解析结束时间，因为我们只需要比较结束时间与时间边界
+		fileEndTime, err := strconv.ParseInt(parts[2], 10, 64)
+		if err != nil {
+			continue // 跳过无法解析的文件
+		}
+
+		// 如果文件的结束时间早于保留边界，则删除该文件
+		if fileEndTime < retentionTimestamp {
+			filePath := filepath.Join(tablePath, file.Name())
+			if err := os.Remove(filePath); err != nil {
+				return fmt.Errorf("failed to remove expired data file %s: %w", filePath, err)
+			}
+		}
+	}
+
+	return nil
+}
+
+// performDownsampling 执行数据降采样
+func (e *StorageEngine) performDownsampling() {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	now := time.Now()
+	for dbName, db := range e.databases {
+		// 跳过没有降采样策略的数据库
+		if len(db.RetentionPolicy.Downsample) == 0 {
+			continue
+		}
+
+		// 对每个表执行降采样
+		for tableName, table := range db.Tables {
+			go func(dbName string, tableName string, table *model.Table, policies []model.DownsamplePolicy) {
+				for _, policy := range policies {
+					// 计算需要降采样的时间范围
+					endTime := now.Add(-time.Hour)                  // 留出1小时缓冲，避免处理最新数据
+					startTime := endTime.Add(-policy.Interval * 10) // 处理10个降采样间隔的数据
+
+					if err := e.downsampleData(dbName, tableName, table, policy, startTime, endTime); err != nil {
+						fmt.Printf("Error downsampling data for %s.%s: %v\n", dbName, tableName, err)
+					}
+				}
+			}(dbName, tableName, table, db.RetentionPolicy.Downsample)
+		}
+	}
+}
+
+// downsampleData 对指定时间范围的数据进行降采样
+func (e *StorageEngine) downsampleData(dbName, tableName string, table *model.Table, policy model.DownsamplePolicy, startTime, endTime time.Time) error {
+	// 确定目标表名
+	targetTable := tableName
+	if policy.Destination != "" {
+		targetTable = policy.Destination
+	}
+
+	// 检查降采样目标表是否存在，不存在则创建
+	if policy.Destination != "" {
+		e.mu.RLock()
+		db := e.databases[dbName]
+		_, exists := db.Tables[targetTable]
+		e.mu.RUnlock()
+
+		if !exists {
+			// 创建与源表相同结构的目标表
+			if err := e.CreateTable(dbName, targetTable, table.Schema, table.TagIndexes); err != nil {
+				return fmt.Errorf("failed to create downsample target table: %w", err)
+			}
+		}
+	}
+
+	// 查询原始数据
+	points, err := e.QueryByTimeRange(dbName, tableName, startTime.UnixNano(), endTime.UnixNano())
+	if err != nil {
+		return fmt.Errorf("failed to query data for downsampling: %w", err)
+	}
+
+	if len(points) == 0 {
+		return nil // 没有数据需要降采样
+	}
+
+	// 按降采样间隔分组
+	groups := make(map[int64][]*model.TimeSeriesPoint)
+	for _, point := range points {
+		// 计算时间戳所在的降采样间隔
+		interval := point.Timestamp / policy.Interval.Nanoseconds()
+		intervalStart := interval * policy.Interval.Nanoseconds()
+		groups[intervalStart] = append(groups[intervalStart], point)
+	}
+
+	// 对每个时间间隔进行降采样
+	for intervalStart, intervalPoints := range groups {
+		// 按标签分组
+		tagGroups := make(map[string][]*model.TimeSeriesPoint)
+		for _, point := range intervalPoints {
+			// 生成标签键
+			tagKey := e.generateTagKey(point.Tags)
+			tagGroups[tagKey] = append(tagGroups[tagKey], point)
+		}
+
+		// 对每个标签组执行降采样
+		for _, tagPoints := range tagGroups {
+			downsampledPoint, err := e.applyDownsampleFunction(tagPoints, policy.Function, intervalStart)
+			if err != nil {
+				return fmt.Errorf("failed to apply downsample function: %w", err)
+			}
+
+			// 插入降采样后的数据点
+			if err := e.InsertPoint(dbName, targetTable, downsampledPoint); err != nil {
+				return fmt.Errorf("failed to insert downsampled point: %w", err)
+			}
+		}
+	}
+
+	return nil
+}
+
+// generateTagKey 生成标签键
+func (e *StorageEngine) generateTagKey(tags map[string]string) string {
+	// 按键排序
+	keys := make([]string, 0, len(tags))
+	for k := range tags {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	// 构建标签键
+	var builder strings.Builder
+	for i, k := range keys {
+		if i > 0 {
+			builder.WriteString(",")
+		}
+		builder.WriteString(k)
+		builder.WriteString("=")
+		builder.WriteString(tags[k])
+	}
+	return builder.String()
+}
+
+// applyDownsampleFunction 应用降采样函数
+func (e *StorageEngine) applyDownsampleFunction(points []*model.TimeSeriesPoint, function string, intervalStart int64) (*model.TimeSeriesPoint, error) {
+	if len(points) == 0 {
+		return nil, fmt.Errorf("no points to downsample")
+	}
+
+	// 使用第一个点的标签
+	result := &model.TimeSeriesPoint{
+		Timestamp: intervalStart,
+		Tags:      make(map[string]string),
+		Fields:    make(map[string]interface{}),
+	}
+
+	// 复制标签
+	for k, v := range points[0].Tags {
+		result.Tags[k] = v
+	}
+
+	// 收集所有字段
+	fieldValues := make(map[string][]float64)
+	for _, point := range points {
+		for field, value := range point.Fields {
+			// 尝试将值转换为float64
+			var floatVal float64
+			switch v := value.(type) {
+			case float64:
+				floatVal = v
+			case float32:
+				floatVal = float64(v)
+			case int:
+				floatVal = float64(v)
+			case int64:
+				floatVal = float64(v)
+			default:
+				// 非数值类型字段不参与降采样
+				continue
+			}
+			fieldValues[field] = append(fieldValues[field], floatVal)
+		}
+	}
+
+	// 对每个字段应用降采样函数
+	for field, values := range fieldValues {
+		if len(values) == 0 {
+			continue
+		}
+
+		switch function {
+		case "avg":
+			sum := 0.0
+			for _, v := range values {
+				sum += v
+			}
+			result.Fields[field] = sum / float64(len(values))
+		case "sum":
+			sum := 0.0
+			for _, v := range values {
+				sum += v
+			}
+			result.Fields[field] = sum
+		case "min":
+			min := values[0]
+			for _, v := range values {
+				if v < min {
+					min = v
+				}
+			}
+			result.Fields[field] = min
+		case "max":
+			max := values[0]
+			for _, v := range values {
+				if v > max {
+					max = v
+				}
+			}
+			result.Fields[field] = max
+		case "count":
+			result.Fields[field] = float64(len(values))
+		case "first":
+			result.Fields[field] = values[0]
+		case "last":
+			result.Fields[field] = values[len(values)-1]
+		default:
+			return nil, fmt.Errorf("unsupported downsample function: %s", function)
+		}
+	}
+
+	return result, nil
+}
+
+// migrateDataBetweenTiers 在不同存储层级之间迁移数据
+func (e *StorageEngine) migrateDataBetweenTiers() {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	now := time.Now()
+	for dbName, db := range e.databases {
+		for tableName := range db.Tables {
+			go func(dbName, tableName string) {
+				if err := e.migrateDatabaseTableData(dbName, tableName, now); err != nil {
+					fmt.Printf("Error migrating data for %s.%s: %v\n", dbName, tableName, err)
+				}
+			}(dbName, tableName)
+		}
+	}
+}
+
+// migrateDatabaseTableData 迁移指定数据库表的数据
+func (e *StorageEngine) migrateDatabaseTableData(dbName, tableName string, now time.Time) error {
+	// 按照优先级排序存储层级
+	tiers := make([]model.StorageTier, len(e.storageTiers))
+	copy(tiers, e.storageTiers)
+	sort.Slice(tiers, func(i, j int) bool {
+		return tiers[i].Priority < tiers[j].Priority
+	})
+
+	// 对每个存储层级执行迁移
+	for i, tier := range tiers {
+		if i == len(tiers)-1 {
+			break // 最后一个层级不需要迁移
+		}
+
+		// 计算当前层级的时间边界
+		tierBoundary := now.Add(-tier.MaxAge)
+		nextTier := tiers[i+1]
+
+		// 迁移超过当前层级最大存储时间的数据到下一个层级
+		if err := e.migrateDataToNextTier(dbName, tableName, tier, nextTier, tierBoundary); err != nil {
+			return fmt.Errorf("failed to migrate data from %s to %s: %w", tier.Name, nextTier.Name, err)
+		}
+	}
+
+	return nil
+}
+
+// migrateDataToNextTier 将数据从一个存储层级迁移到下一个层级
+func (e *StorageEngine) migrateDataToNextTier(dbName, tableName string, currentTier, nextTier model.StorageTier, timeBoundary time.Time) error {
+	// 获取当前层级的数据目录
+	var sourceDir string
+	if currentTier.Name == "hot" {
+		sourceDir = filepath.Join(e.dataDir, dbName, tableName)
+	} else {
+		sourceDir = filepath.Join(e.dataDir, currentTier.Name, dbName, tableName)
+	}
+
+	// 获取目标层级的数据目录
+	var targetDir string
+	if nextTier.Name == "cold" {
+		targetDir = filepath.Join(e.coldDir, dbName, tableName)
+	} else {
+		targetDir = filepath.Join(e.dataDir, nextTier.Name, dbName, tableName)
+	}
+
+	// 确保目标目录存在
+	if err := os.MkdirAll(targetDir, 0755); err != nil {
+		return fmt.Errorf("failed to create target directory: %w", err)
+	}
+
+	// 获取源目录中的所有数据文件
+	files, err := os.ReadDir(sourceDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // 源目录不存在，无需迁移
+		}
+		return fmt.Errorf("failed to read source directory: %w", err)
+	}
+
+	// 遍历数据文件，迁移符合条件的文件
+	for _, file := range files {
+		if file.IsDir() {
+			continue // 跳过子目录
+		}
+
+		// 解析文件名，获取时间范围
+		// 假设文件名格式为: data_<startTime>_<endTime>.tsdb
+		parts := strings.Split(file.Name(), "_")
+		if len(parts) != 3 || !strings.HasSuffix(parts[2], ".tsdb") {
+			continue // 跳过不符合命名规则的文件
+		}
+
+		// 解析结束时间
+		endTimeStr := strings.TrimSuffix(parts[2], ".tsdb")
+		fileEndTime, err := strconv.ParseInt(endTimeStr, 10, 64)
+		if err != nil {
+			continue // 跳过无法解析的文件
+		}
+
+		// 如果文件的结束时间早于时间边界，则迁移该文件
+		if fileEndTime < timeBoundary.UnixNano() {
+			sourceFile := filepath.Join(sourceDir, file.Name())
+			targetFile := filepath.Join(targetDir, file.Name())
+
+			// 如果目标层级需要压缩，且当前层级不压缩
+			if nextTier.Compress && !currentTier.Compress {
+				// 读取源文件
+				data, err := os.ReadFile(sourceFile)
+				if err != nil {
+					return fmt.Errorf("failed to read source file: %w", err)
+				}
+
+				// 压缩数据
+				compressedData, err := e.compressData(data)
+				if err != nil {
+					return fmt.Errorf("failed to compress data: %w", err)
+				}
+
+				// 写入目标文件
+				if err := os.WriteFile(targetFile+".gz", compressedData, 0644); err != nil {
+					return fmt.Errorf("failed to write compressed file: %w", err)
+				}
+			} else {
+				// 直接复制文件
+				if err := e.copyFile(sourceFile, targetFile); err != nil {
+					return fmt.Errorf("failed to copy file: %w", err)
+				}
+			}
+
+			// 删除源文件
+			if err := os.Remove(sourceFile); err != nil {
+				return fmt.Errorf("failed to remove source file: %w", err)
+			}
+		}
+	}
+
+	return nil
+}
+
+// compressData 压缩数据
+func (e *StorageEngine) compressData(data []byte) ([]byte, error) {
+	var buf bytes.Buffer
+	gzWriter := gzip.NewWriter(&buf)
+
+	if _, err := gzWriter.Write(data); err != nil {
+		return nil, fmt.Errorf("failed to write to gzip writer: %w", err)
+	}
+
+	if err := gzWriter.Close(); err != nil {
+		return nil, fmt.Errorf("failed to close gzip writer: %w", err)
+	}
+
+	return buf.Bytes(), nil
+}
+
+// copyFile 复制文件
+func (e *StorageEngine) copyFile(src, dst string) error {
+	sourceFile, err := os.Open(src)
+	if err != nil {
+		return fmt.Errorf("failed to open source file: %w", err)
+	}
+	defer sourceFile.Close()
+
+	destFile, err := os.Create(dst)
+	if err != nil {
+		return fmt.Errorf("failed to create destination file: %w", err)
+	}
+	defer destFile.Close()
+
+	if _, err := io.Copy(destFile, sourceFile); err != nil {
+		return fmt.Errorf("failed to copy file contents: %w", err)
+	}
+
+	return nil
+}
+
+// queryTierByTimeRange 查询指定存储层级的数据
+func (e *StorageEngine) queryTierByTimeRange(dbName, tableName, tierName string, start, end int64) ([]*model.TimeSeriesPoint, error) {
+	var tierDir string
+	if tierName == "hot" {
+		tierDir = filepath.Join(e.dataDir, dbName, tableName)
+	} else if tierName == "cold" {
+		tierDir = filepath.Join(e.coldDir, dbName, tableName)
+	} else {
+		tierDir = filepath.Join(e.dataDir, tierName, dbName, tableName)
+	}
+
+	// 检查目录是否存在
+	if _, err := os.Stat(tierDir); os.IsNotExist(err) {
+		return nil, nil // 目录不存在，返回空结果
+	}
+
+	// 获取目录中的所有数据文件
+	files, err := os.ReadDir(tierDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read tier directory: %w", err)
+	}
+
+	var points []*model.TimeSeriesPoint
+	for _, file := range files {
+		if file.IsDir() {
+			continue // 跳过子目录
+		}
+
+		// 解析文件名，获取时间范围
+		// 假设文件名格式为: data_<startTime>_<endTime>.tsdb 或 data_<startTime>_<endTime>.tsdb.gz
+		fileName := file.Name()
+		isCompressed := strings.HasSuffix(fileName, ".gz")
+		if isCompressed {
+			fileName = strings.TrimSuffix(fileName, ".gz")
+		}
+
+		parts := strings.Split(fileName, "_")
+		if len(parts) != 3 || !strings.HasSuffix(parts[2], ".tsdb") {
+			continue // 跳过不符合命名规则的文件
+		}
+
+		// 解析文件的时间范围
+		startTimeStr := parts[1]
+		endTimeStr := strings.TrimSuffix(parts[2], ".tsdb")
+
+		fileStartTime, err := strconv.ParseInt(startTimeStr, 10, 64)
+		if err != nil {
+			continue // 跳过无法解析的文件
+		}
+
+		fileEndTime, err := strconv.ParseInt(endTimeStr, 10, 64)
+		if err != nil {
+			continue // 跳过无法解析的文件
+		}
+
+		// 检查文件的时间范围是否与查询范围重叠
+		if fileEndTime < start || fileStartTime > end {
+			continue // 文件的时间范围与查询范围不重叠，跳过
+		}
+
+		// 读取文件内容
+		filePath := filepath.Join(tierDir, file.Name())
+		var fileData []byte
+		if isCompressed {
+			// 读取并解压缩文件
+			compressedData, err := os.ReadFile(filePath)
+			if err != nil {
+				return nil, fmt.Errorf("failed to read compressed file: %w", err)
+			}
+
+			fileData, err = e.decompressData(compressedData)
+			if err != nil {
+				return nil, fmt.Errorf("failed to decompress file: %w", err)
+			}
+		} else {
+			// 直接读取文件
+			var err error
+			fileData, err = os.ReadFile(filePath)
+			if err != nil {
+				return nil, fmt.Errorf("failed to read file: %w", err)
+			}
+		}
+
+		// 解析文件内容，提取数据点
+		filePoints, err := e.parseDataFile(fileData, start, end)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse data file: %w", err)
+		}
+
+		points = append(points, filePoints...)
+	}
+
+	return points, nil
+}
+
+// decompressData 解压缩数据
+func (e *StorageEngine) decompressData(compressedData []byte) ([]byte, error) {
+	gzReader, err := gzip.NewReader(bytes.NewReader(compressedData))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create gzip reader: %w", err)
+	}
+	defer gzReader.Close()
+
+	var buf bytes.Buffer
+	if _, err := io.Copy(&buf, gzReader); err != nil {
+		return nil, fmt.Errorf("failed to decompress data: %w", err)
+	}
+
+	return buf.Bytes(), nil
+}
+
+// parseDataFile 解析数据文件
+func (e *StorageEngine) parseDataFile(data []byte, startTime, endTime int64) ([]*model.TimeSeriesPoint, error) {
+	// 这里应该实现从二进制数据解析时序数据点的逻辑
+	// 为简化示例，这里假设数据是JSON格式的
+	var points []*model.TimeSeriesPoint
+	if err := json.Unmarshal(data, &points); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal data: %w", err)
+	}
+
+	// 过滤出符合时间范围的数据点
+	var result []*model.TimeSeriesPoint
+	for _, point := range points {
+		if point.Timestamp >= startTime && point.Timestamp <= endTime {
+			result = append(result, point)
+		}
+	}
+
+	return result, nil
 }
