@@ -224,27 +224,99 @@ func registerCommands(handler *protocol.CommandHandler, storageEngine *storage.S
 		}, nil
 	})
 
+	// 添加use命令支持
+	handler.Register("use", func(ctx context.Context, cmd bson.D) (bson.D, error) {
+		fmt.Printf("use命令: 开始处理\n")
+
+		// 解析命令参数
+		var dbName string
+		for _, elem := range cmd {
+			if elem.Key == "use" && elem.Value != nil {
+				if str, ok := elem.Value.(string); ok {
+					dbName = str
+					fmt.Printf("use命令: 数据库名称: %s\n", dbName)
+				}
+			}
+		}
+
+		if dbName == "" {
+			fmt.Printf("use命令: 缺少数据库名称\n")
+			return nil, fmt.Errorf("missing database name")
+		}
+
+		// 设置当前数据库
+		session, ok := ctx.Value("session").(*protocol.Session)
+		if !ok {
+			fmt.Printf("use命令: 无法获取会话\n")
+			return nil, fmt.Errorf("session not found")
+		}
+
+		// 检查数据库是否存在
+		exists := false
+		databases, err := storageEngine.ListDatabases()
+		if err != nil {
+			fmt.Printf("use命令: 获取数据库列表失败: %v\n", err)
+		} else {
+			for _, db := range databases {
+				if db.Name == dbName {
+					exists = true
+					break
+				}
+			}
+		}
+
+		// 即使数据库不存在，也允许切换（MongoDB的行为）
+		if !exists {
+			fmt.Printf("use命令: 数据库 %s 不存在，但仍然切换\n", dbName)
+		}
+
+		// 设置当前数据库
+		session.CurrentDB = dbName
+		fmt.Printf("use命令: 切换到数据库 %s\n", dbName)
+
+		return bson.D{{"ok", 1}}, nil
+	})
+
 	// 创建数据库命令
 	handler.Register("create", func(ctx context.Context, cmd bson.D) (bson.D, error) {
+		fmt.Printf("create命令: 开始处理\n")
+
 		// 解析命令参数
 		var dbName string
 		var isTimeseries bool
 		var timeField string
+		var collectionName string
+
+		// 获取当前数据库名称
+		session, ok := ctx.Value("session").(*protocol.Session)
+		if ok && session.CurrentDB != "" {
+			fmt.Printf("create命令: 当前会话数据库: %s\n", session.CurrentDB)
+		} else {
+			fmt.Printf("create命令: 当前会话没有选择数据库\n")
+		}
 
 		for _, elem := range cmd {
 			switch elem.Key {
 			case "create":
 				if str, ok := elem.Value.(string); ok {
+					collectionName = str
+					fmt.Printf("create命令: 集合名称: %s\n", collectionName)
+				}
+			case "$db":
+				if str, ok := elem.Value.(string); ok {
 					dbName = str
+					fmt.Printf("create命令: 命令中指定的数据库: %s\n", dbName)
 				}
 			case "timeseries":
 				if doc, ok := elem.Value.(bson.D); ok {
 					isTimeseries = true
+					fmt.Printf("create命令: 是时序集合\n")
 					for _, field := range doc {
 						switch field.Key {
 						case "timeField":
 							if str, ok := field.Value.(string); ok {
 								timeField = str
+								fmt.Printf("create命令: 时间字段: %s\n", timeField)
 							}
 						}
 					}
@@ -252,33 +324,85 @@ func registerCommands(handler *protocol.CommandHandler, storageEngine *storage.S
 			}
 		}
 
+		// 如果命令中没有指定数据库，则使用会话中的当前数据库
 		if dbName == "" {
+			if session != nil && session.CurrentDB != "" {
+				dbName = session.CurrentDB
+				fmt.Printf("create命令: 使用会话数据库: %s\n", dbName)
+			} else {
+				// 如果没有当前数据库，使用集合名称作为数据库名称
+				dbName = collectionName
+				fmt.Printf("create命令: 没有当前数据库，使用集合名称作为数据库名称: %s\n", dbName)
+			}
+		}
+
+		if dbName == "" {
+			fmt.Printf("create命令: 缺少数据库名称\n")
 			return nil, fmt.Errorf("missing database name")
 		}
 
-		// 创建数据库
-		retentionPolicy := model.RetentionPolicy{
-			Duration:  30 * 24 * time.Hour, // 默认30天
-			Precision: "ns",
-		}
-
-		if err := storageEngine.CreateDatabase(dbName, retentionPolicy); err != nil {
+		// 检查数据库是否存在
+		databases, err := storageEngine.ListDatabases()
+		if err != nil {
+			fmt.Printf("create命令: 获取数据库列表失败: %v\n", err)
 			return nil, err
 		}
 
-		// 如果是时序集合，创建表
-		if isTimeseries {
-			schema := model.Schema{
-				TimeField: timeField,
-				TagFields: make(map[string]string),
-				Fields:    make(map[string]string),
-			}
-
-			if err := storageEngine.CreateTable(dbName, dbName, schema, nil); err != nil {
-				return nil, err
+		dbExists := false
+		var existingDB *model.Database
+		for _, db := range databases {
+			if db.Name == dbName {
+				dbExists = true
+				existingDB = db
+				break
 			}
 		}
 
+		// 如果数据库不存在，创建它
+		if !dbExists {
+			fmt.Printf("create命令: 数据库 %s 不存在，开始创建\n", dbName)
+			retentionPolicy := model.RetentionPolicy{
+				Duration:  30 * 24 * time.Hour, // 默认30天
+				Precision: "ns",
+			}
+
+			if err := storageEngine.CreateDatabase(dbName, retentionPolicy); err != nil {
+				fmt.Printf("create命令: 创建数据库失败: %v\n", err)
+				return nil, err
+			}
+			fmt.Printf("create命令: 创建数据库成功: %s\n", dbName)
+		} else {
+			fmt.Printf("create命令: 数据库 %s 已存在\n", dbName)
+
+			// 检查表是否已存在
+			if existingDB != nil {
+				if _, tableExists := existingDB.Tables[collectionName]; tableExists {
+					fmt.Printf("create命令: 表 %s 已存在于数据库 %s 中\n", collectionName, dbName)
+					return nil, fmt.Errorf("table %s already exists in database %s", collectionName, dbName)
+				}
+			}
+		}
+
+		// 创建集合（表）
+		fmt.Printf("create命令: 开始创建集合: %s\n", collectionName)
+		schema := model.Schema{
+			TagFields: make(map[string]string),
+			Fields:    make(map[string]string),
+		}
+
+		// 如果是时序集合，设置时间字段
+		if isTimeseries && timeField != "" {
+			fmt.Printf("create命令: 设置时间字段: %s\n", timeField)
+			schema.TimeField = timeField
+		}
+
+		if err := storageEngine.CreateTable(dbName, collectionName, schema, nil); err != nil {
+			fmt.Printf("create命令: 创建集合失败: %v\n", err)
+			return nil, err
+		}
+		fmt.Printf("create命令: 创建集合成功: %s\n", collectionName)
+
+		fmt.Printf("create命令: 处理完成\n")
 		return bson.D{{"ok", 1}}, nil
 	})
 
@@ -342,47 +466,125 @@ func registerCommands(handler *protocol.CommandHandler, storageEngine *storage.S
 		}, nil
 	})
 
-	// 插入命令
+	// 插入文档命令
 	handler.Register("insert", func(ctx context.Context, cmd bson.D) (bson.D, error) {
-		var dbName, tableName string
-		var documents bson.A
+		fmt.Printf("insert命令: 开始处理\n")
+
+		var dbName, collName string
+		var documents []interface{}
 
 		for _, elem := range cmd {
 			switch elem.Key {
 			case "insert":
 				if str, ok := elem.Value.(string); ok {
-					tableName = str
+					collName = str
+					fmt.Printf("insert命令: 集合名称: %s\n", collName)
 				}
 			case "documents":
 				if docs, ok := elem.Value.(bson.A); ok {
-					documents = docs
+					documents = make([]interface{}, len(docs))
+					for i, doc := range docs {
+						documents[i] = doc
+					}
+					fmt.Printf("insert命令: 文档数量: %d\n", len(documents))
 				}
 			case "$db":
 				if str, ok := elem.Value.(string); ok {
 					dbName = str
+					fmt.Printf("insert命令: 数据库名称: %s\n", dbName)
 				}
 			}
 		}
 
-		if dbName == "" || tableName == "" || len(documents) == 0 {
-			return nil, fmt.Errorf("missing required parameters")
+		// 如果没有指定数据库，使用当前会话的数据库
+		if dbName == "" {
+			session, ok := ctx.Value("session").(*protocol.Session)
+			if ok && session.CurrentDB != "" {
+				dbName = session.CurrentDB
+				fmt.Printf("insert命令: 使用会话数据库: %s\n", dbName)
+			}
+		}
+
+		if dbName == "" {
+			fmt.Printf("insert命令: 缺少数据库名称\n")
+			return nil, fmt.Errorf("missing database name")
+		}
+
+		if collName == "" {
+			fmt.Printf("insert命令: 缺少集合名称\n")
+			return nil, fmt.Errorf("missing collection name")
+		}
+
+		if len(documents) == 0 {
+			fmt.Printf("insert命令: 没有要插入的文档\n")
+			return nil, fmt.Errorf("no documents to insert")
+		}
+
+		// 检查数据库和集合是否存在
+		databases, err := storageEngine.ListDatabases()
+		if err != nil {
+			fmt.Printf("insert命令: 获取数据库列表失败: %v\n", err)
+			return nil, err
+		}
+
+		dbExists := false
+		var db *model.Database
+		for _, d := range databases {
+			if d.Name == dbName {
+				dbExists = true
+				db = d
+				break
+			}
+		}
+
+		if !dbExists {
+			fmt.Printf("insert命令: 数据库 %s 不存在\n", dbName)
+			return nil, fmt.Errorf("database %s does not exist", dbName)
+		}
+
+		tableExists := false
+		if db != nil {
+			_, tableExists = db.Tables[collName]
+		}
+
+		if !tableExists {
+			fmt.Printf("insert命令: 集合 %s 在数据库 %s 中不存在\n", collName, dbName)
+			return nil, fmt.Errorf("collection %s does not exist in database %s", collName, dbName)
 		}
 
 		// 插入文档
+		fmt.Printf("insert命令: 开始插入文档到 %s.%s\n", dbName, collName)
+
+		// 将文档转换为时序数据点
 		for _, doc := range documents {
 			if bsonDoc, ok := doc.(bson.D); ok {
-				point, err := model.FromBSON(bsonDoc)
-				if err != nil {
-					return nil, err
+				// 创建时序数据点
+				point := &model.TimeSeriesPoint{
+					Timestamp: time.Now().UnixNano(),
+					Tags:      make(map[string]string),
+					Fields:    make(map[string]interface{}),
 				}
 
-				if err := storageEngine.InsertPoint(dbName, tableName, point); err != nil {
+				// 解析文档字段
+				for _, field := range bsonDoc {
+					// 假设所有字段都是普通字段
+					point.Fields[field.Key] = field.Value
+				}
+
+				// 插入数据点
+				if err := storageEngine.InsertPoint(dbName, collName, point); err != nil {
+					fmt.Printf("insert命令: 插入文档失败: %v\n", err)
 					return nil, err
 				}
 			}
 		}
 
-		return bson.D{{"ok", 1}, {"n", len(documents)}}, nil
+		fmt.Printf("insert命令: 文档插入成功\n")
+
+		return bson.D{
+			{"ok", 1},
+			{"n", len(documents)},
+		}, nil
 	})
 
 	// 查询命令
@@ -1268,6 +1470,294 @@ func registerCommands(handler *protocol.CommandHandler, storageEngine *storage.S
 			{"fsUsedSize", scaledFileSize},
 			{"fsTotalSize", scaledFileSize * 10}, // 假设总空间是已用空间的10倍
 			{"ok", 1},
+		}, nil
+	})
+
+	// 创建集合命令
+	handler.Register("createCollection", func(ctx context.Context, cmd bson.D) (bson.D, error) {
+		var dbName, collName string
+		var timeseriesOptions *model.TimeSeriesOptions
+
+		for _, elem := range cmd {
+			switch elem.Key {
+			case "createCollection":
+				if str, ok := elem.Value.(string); ok {
+					collName = str
+				}
+			case "$db":
+				if str, ok := elem.Value.(string); ok {
+					dbName = str
+				}
+			case "timeseries":
+				if doc, ok := elem.Value.(bson.D); ok {
+					timeseriesOptions = &model.TimeSeriesOptions{}
+					for _, field := range doc {
+						switch field.Key {
+						case "timeField":
+							if str, ok := field.Value.(string); ok {
+								timeseriesOptions.TimeField = str
+							}
+						case "metaField":
+							if str, ok := field.Value.(string); ok {
+								timeseriesOptions.MetaField = str
+							}
+						case "granularity":
+							if str, ok := field.Value.(string); ok {
+								timeseriesOptions.Granularity = str
+							}
+						}
+					}
+				}
+			case "expireAfterSeconds":
+				if val, ok := elem.Value.(int64); ok {
+					if timeseriesOptions == nil {
+						timeseriesOptions = &model.TimeSeriesOptions{}
+					}
+					timeseriesOptions.ExpirySeconds = val
+				}
+			}
+		}
+
+		if dbName == "" || collName == "" {
+			return nil, fmt.Errorf("missing required parameters")
+		}
+
+		// 检查数据库是否存在
+		databases, err := storageEngine.ListDatabases()
+		if err != nil {
+			return nil, fmt.Errorf("failed to list databases: %w", err)
+		}
+
+		dbExists := false
+		for _, db := range databases {
+			if db.Name == dbName {
+				dbExists = true
+				break
+			}
+		}
+
+		// 如果数据库不存在，创建数据库
+		if !dbExists {
+			retentionPolicy := model.RetentionPolicy{
+				Duration:  30 * 24 * time.Hour, // 默认30天
+				Precision: "ns",
+			}
+
+			if err := storageEngine.CreateDatabase(dbName, retentionPolicy); err != nil {
+				return nil, fmt.Errorf("failed to create database: %w", err)
+			}
+		}
+
+		// 检查集合是否已存在
+		tables, err := storageEngine.ListTables(dbName)
+		if err != nil {
+			return nil, fmt.Errorf("failed to list tables: %w", err)
+		}
+
+		for _, table := range tables {
+			if table.Name == collName {
+				return nil, fmt.Errorf("collection %s already exists", collName)
+			}
+		}
+
+		// 创建集合
+		schema := model.Schema{
+			Fields:    make(map[string]string),
+			TagFields: make(map[string]string),
+		}
+
+		// 如果是时序集合
+		if timeseriesOptions != nil {
+			schema.TimeField = timeseriesOptions.TimeField
+			if timeseriesOptions.MetaField != "" {
+				// 将元数据字段添加为标签字段
+				schema.TagFields[timeseriesOptions.MetaField] = "object"
+			}
+		}
+
+		// 创建表
+		if err := storageEngine.CreateTable(dbName, collName, schema, nil); err != nil {
+			return nil, fmt.Errorf("failed to create collection: %w", err)
+		}
+
+		return bson.D{{"ok", 1}}, nil
+	})
+
+	// 清空集合命令
+	handler.Register("clear", func(ctx context.Context, cmd bson.D) (bson.D, error) {
+		fmt.Printf("clear命令: 开始处理\n")
+
+		var dbName, collName string
+
+		for _, elem := range cmd {
+			switch elem.Key {
+			case "clear":
+				if str, ok := elem.Value.(string); ok {
+					collName = str
+					fmt.Printf("clear命令: 集合名称: %s\n", collName)
+				}
+			case "$db":
+				if str, ok := elem.Value.(string); ok {
+					dbName = str
+					fmt.Printf("clear命令: 数据库名称: %s\n", dbName)
+				}
+			}
+		}
+
+		// 如果没有指定数据库，使用当前会话的数据库
+		if dbName == "" {
+			session, ok := ctx.Value("session").(*protocol.Session)
+			if ok && session.CurrentDB != "" {
+				dbName = session.CurrentDB
+				fmt.Printf("clear命令: 使用会话数据库: %s\n", dbName)
+			}
+		}
+
+		if dbName == "" {
+			fmt.Printf("clear命令: 缺少数据库名称\n")
+			return nil, fmt.Errorf("missing database name")
+		}
+
+		if collName == "" {
+			fmt.Printf("clear命令: 缺少集合名称\n")
+			return nil, fmt.Errorf("missing collection name")
+		}
+
+		// 清空集合
+		fmt.Printf("clear命令: 开始清空集合 %s.%s\n", dbName, collName)
+		if err := storageEngine.ClearTable(dbName, collName); err != nil {
+			fmt.Printf("clear命令: 清空集合失败: %v\n", err)
+			return nil, err
+		}
+		fmt.Printf("clear命令: 集合清空成功\n")
+
+		return bson.D{
+			{"ok", 1},
+			{"cleared", collName},
+			{"ns", dbName + "." + collName},
+		}, nil
+	})
+
+	// 插入单个文档命令
+	handler.Register("insertOne", func(ctx context.Context, cmd bson.D) (bson.D, error) {
+		fmt.Printf("insertOne命令: 开始处理\n")
+
+		var dbName, collName string
+		var document interface{}
+
+		for _, elem := range cmd {
+			switch elem.Key {
+			case "insertOne":
+				if doc, ok := elem.Value.(bson.D); ok {
+					for _, field := range doc {
+						if field.Key == "document" {
+							document = field.Value
+							fmt.Printf("insertOne命令: 找到文档\n")
+						}
+					}
+				}
+			case "collection":
+				if str, ok := elem.Value.(string); ok {
+					collName = str
+					fmt.Printf("insertOne命令: 集合名称: %s\n", collName)
+				}
+			case "$db":
+				if str, ok := elem.Value.(string); ok {
+					dbName = str
+					fmt.Printf("insertOne命令: 数据库名称: %s\n", dbName)
+				}
+			}
+		}
+
+		// 如果没有指定数据库，使用当前会话的数据库
+		if dbName == "" {
+			session, ok := ctx.Value("session").(*protocol.Session)
+			if ok && session.CurrentDB != "" {
+				dbName = session.CurrentDB
+				fmt.Printf("insertOne命令: 使用会话数据库: %s\n", dbName)
+			}
+		}
+
+		if dbName == "" {
+			fmt.Printf("insertOne命令: 缺少数据库名称\n")
+			return nil, fmt.Errorf("missing database name")
+		}
+
+		if collName == "" {
+			fmt.Printf("insertOne命令: 缺少集合名称\n")
+			return nil, fmt.Errorf("missing collection name")
+		}
+
+		if document == nil {
+			fmt.Printf("insertOne命令: 没有要插入的文档\n")
+			return nil, fmt.Errorf("no document to insert")
+		}
+
+		// 检查数据库和集合是否存在
+		databases, err := storageEngine.ListDatabases()
+		if err != nil {
+			fmt.Printf("insertOne命令: 获取数据库列表失败: %v\n", err)
+			return nil, err
+		}
+
+		dbExists := false
+		var db *model.Database
+		for _, d := range databases {
+			if d.Name == dbName {
+				dbExists = true
+				db = d
+				break
+			}
+		}
+
+		if !dbExists {
+			fmt.Printf("insertOne命令: 数据库 %s 不存在\n", dbName)
+			return nil, fmt.Errorf("database %s does not exist", dbName)
+		}
+
+		tableExists := false
+		if db != nil {
+			_, tableExists = db.Tables[collName]
+		}
+
+		if !tableExists {
+			fmt.Printf("insertOne命令: 集合 %s 在数据库 %s 中不存在\n", collName, dbName)
+			return nil, fmt.Errorf("collection %s does not exist in database %s", collName, dbName)
+		}
+
+		// 插入文档
+		fmt.Printf("insertOne命令: 开始插入文档到 %s.%s\n", dbName, collName)
+
+		// 将文档转换为时序数据点
+		if bsonDoc, ok := document.(bson.D); ok {
+			// 创建时序数据点
+			point := &model.TimeSeriesPoint{
+				Timestamp: time.Now().UnixNano(),
+				Tags:      make(map[string]string),
+				Fields:    make(map[string]interface{}),
+			}
+
+			// 解析文档字段
+			for _, field := range bsonDoc {
+				// 假设所有字段都是普通字段
+				point.Fields[field.Key] = field.Value
+			}
+
+			// 插入数据点
+			if err := storageEngine.InsertPoint(dbName, collName, point); err != nil {
+				fmt.Printf("insertOne命令: 插入文档失败: %v\n", err)
+				return nil, err
+			}
+		} else {
+			fmt.Printf("insertOne命令: 文档格式不正确\n")
+			return nil, fmt.Errorf("invalid document format")
+		}
+
+		fmt.Printf("insertOne命令: 文档插入成功\n")
+
+		return bson.D{
+			{"ok", 1},
+			{"n", 1},
 		}, nil
 	})
 }

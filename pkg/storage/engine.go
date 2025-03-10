@@ -52,7 +52,7 @@ type TimeRange struct {
 // NewStorageEngine 创建新的存储引擎
 func NewStorageEngine(baseDir string) (*StorageEngine, error) {
 	// 创建目录结构
-	dataDir := filepath.Join(baseDir, "data")
+	dataDir := baseDir // 直接使用 baseDir 作为数据目录
 	walDir := filepath.Join(baseDir, "wal")
 	metaDir := filepath.Join(baseDir, "meta")
 	coldDir := filepath.Join(baseDir, "cold")
@@ -141,34 +141,165 @@ func NewQueryOptimizer(engine *StorageEngine) *QueryOptimizer {
 
 // loadMetadata 加载元数据
 func (e *StorageEngine) loadMetadata() error {
+	fmt.Printf("开始加载元数据\n")
+
 	metadataPath := filepath.Join(e.dataDir, "metadata.json")
 
 	// 检查元数据文件是否存在
 	if _, err := os.Stat(metadataPath); os.IsNotExist(err) {
 		// 元数据文件不存在，初始化空数据库
+		fmt.Printf("元数据文件不存在，初始化空数据库\n")
 		e.databases = make(map[string]*model.Database)
 		return nil
 	}
 
 	// 读取元数据文件
+	fmt.Printf("读取元数据文件: %s\n", metadataPath)
 	data, err := os.ReadFile(metadataPath)
 	if err != nil {
+		fmt.Printf("读取元数据文件失败: %v\n", err)
 		return fmt.Errorf("failed to read metadata file: %w", err)
 	}
 
 	// 解析元数据
-	var metadata struct {
-		Databases map[string]*model.Database `json:"databases"`
-	}
+	fmt.Printf("解析元数据\n")
+	var metadata map[string]interface{}
 
 	if err := json.Unmarshal(data, &metadata); err != nil {
+		fmt.Printf("解析元数据失败: %v\n", err)
 		return fmt.Errorf("failed to unmarshal metadata: %w", err)
 	}
 
-	// 设置数据库
-	e.databases = metadata.Databases
+	// 初始化数据库映射
+	e.databases = make(map[string]*model.Database)
+
+	// 解析数据库
+	databasesData, ok := metadata["databases"]
+	if !ok {
+		fmt.Printf("元数据中没有数据库信息\n")
+		return nil
+	}
+
+	databasesMap, ok := databasesData.(map[string]interface{})
+	if !ok {
+		fmt.Printf("数据库信息格式不正确\n")
+		return fmt.Errorf("invalid databases format")
+	}
+
+	// 遍历数据库
+	for dbName, dbData := range databasesMap {
+		fmt.Printf("加载数据库: %s\n", dbName)
+
+		dbMap, ok := dbData.(map[string]interface{})
+		if !ok {
+			fmt.Printf("数据库 %s 格式不正确\n", dbName)
+			continue
+		}
+
+		// 创建数据库对象
+		db := &model.Database{
+			Name:   dbName,
+			Tables: make(map[string]*model.Table),
+		}
+
+		// 解析保留策略
+		if retentionData, ok := dbMap["retentionPolicy"].(map[string]interface{}); ok {
+			if duration, ok := retentionData["Duration"].(float64); ok {
+				db.RetentionPolicy.Duration = time.Duration(duration)
+			}
+			if precision, ok := retentionData["Precision"].(string); ok {
+				db.RetentionPolicy.Precision = precision
+			}
+		}
+
+		// 解析表
+		if tablesData, ok := dbMap["tables"].(map[string]interface{}); ok {
+			for tableName, tableData := range tablesData {
+				fmt.Printf("加载表: %s.%s\n", dbName, tableName)
+
+				tableMap, ok := tableData.(map[string]interface{})
+				if !ok {
+					fmt.Printf("表 %s.%s 格式不正确\n", dbName, tableName)
+					continue
+				}
+
+				// 创建表对象
+				table := &model.Table{
+					Name:     tableName,
+					Database: dbName,
+				}
+
+				// 解析模式
+				if schemaData, ok := tableMap["schema"].(map[string]interface{}); ok {
+					if timeField, ok := schemaData["TimeField"].(string); ok {
+						table.Schema.TimeField = timeField
+					}
+
+					if tagFields, ok := schemaData["TagFields"].(map[string]interface{}); ok {
+						table.Schema.TagFields = make(map[string]string)
+						for k, v := range tagFields {
+							if strVal, ok := v.(string); ok {
+								table.Schema.TagFields[k] = strVal
+							}
+						}
+					}
+
+					if fields, ok := schemaData["Fields"].(map[string]interface{}); ok {
+						table.Schema.Fields = make(map[string]string)
+						for k, v := range fields {
+							if strVal, ok := v.(string); ok {
+								table.Schema.Fields[k] = strVal
+							}
+						}
+					}
+				}
+
+				// 解析标签索引
+				if tagIndexesData, ok := tableMap["tagIndexes"].([]interface{}); ok {
+					for _, indexData := range tagIndexesData {
+						indexMap, ok := indexData.(map[string]interface{})
+						if !ok {
+							continue
+						}
+
+						tagIndex := model.TagIndex{}
+
+						if name, ok := indexMap["Name"].(string); ok {
+							tagIndex.Name = name
+						}
+
+						if indexType, ok := indexMap["Type"].(string); ok {
+							tagIndex.Type = indexType
+						}
+
+						if unique, ok := indexMap["Unique"].(bool); ok {
+							tagIndex.Unique = unique
+						}
+
+						if fieldsData, ok := indexMap["Fields"].([]interface{}); ok {
+							tagIndex.Fields = make([]string, 0, len(fieldsData))
+							for _, field := range fieldsData {
+								if strField, ok := field.(string); ok {
+									tagIndex.Fields = append(tagIndex.Fields, strField)
+								}
+							}
+						}
+
+						table.TagIndexes = append(table.TagIndexes, tagIndex)
+					}
+				}
+
+				// 添加表到数据库
+				db.Tables[tableName] = table
+			}
+		}
+
+		// 添加数据库到映射
+		e.databases[dbName] = db
+	}
 
 	// 重新创建索引
+	fmt.Printf("重新创建索引\n")
 	ctx := context.Background()
 	for dbName, db := range e.databases {
 		for tableName, table := range db.Tables {
@@ -204,46 +335,149 @@ func (e *StorageEngine) loadMetadata() error {
 				}
 
 				// 创建索引
-				idx, err := e.indexMgr.CreateIndex(ctx, dbName, tableName, options)
+				fmt.Printf("创建索引: %s.%s.%s\n", dbName, tableName, tagIndex.Name)
+				_, err := e.indexMgr.CreateIndex(ctx, dbName, tableName, options)
 				if err != nil {
-					return fmt.Errorf("failed to recreate index %s: %w", tagIndex.Name, err)
+					fmt.Printf("创建索引失败: %v\n", err)
+					// 继续处理其他索引
 				}
+			}
 
-				// 从现有数据填充索引
-				if err := e.fillIndexFromExistingData(ctx, dbName, tableName, idx, tagIndex.Fields); err != nil {
-					return fmt.Errorf("failed to fill index %s from existing data: %w", tagIndex.Name, err)
+			// 创建时间索引
+			if table.Schema.TimeField != "" {
+				fmt.Printf("创建时间索引: %s.%s.time_idx\n", dbName, tableName)
+				options := index.IndexOptions{
+					Type:   index.IndexTypeBTree,
+					Name:   "time_idx",
+					Fields: []string{table.Schema.TimeField},
+				}
+				_, err := e.indexMgr.CreateIndex(ctx, dbName, tableName, options)
+				if err != nil {
+					fmt.Printf("创建时间索引失败: %v\n", err)
+					// 继续处理其他表
 				}
 			}
 		}
 	}
 
+	fmt.Printf("元数据加载完成\n")
 	return nil
 }
 
 // saveMetadata 保存元数据
-func (e *StorageEngine) saveMetadata() error {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
+func (e *StorageEngine) saveMetadata(alreadyLocked ...bool) error {
+	fmt.Printf("开始保存元数据\n")
+
+	// 检查是否已经持有锁
+	isAlreadyLocked := false
+	if len(alreadyLocked) > 0 && alreadyLocked[0] {
+		isAlreadyLocked = true
+		fmt.Printf("saveMetadata: 调用者已持有锁，跳过加锁\n")
+	}
+
+	// 如果没有持有锁，则加锁
+	if !isAlreadyLocked {
+		e.mu.Lock()
+		defer func() {
+			e.mu.Unlock()
+			fmt.Printf("saveMetadata: 解锁完成\n")
+		}()
+	}
+
+	// 创建可序列化的数据库映射
+	serializableDatabases := make(map[string]interface{})
+	for dbName, db := range e.databases {
+		fmt.Printf("处理数据库: %s\n", dbName)
+
+		// 创建可序列化的表映射
+		serializableTables := make(map[string]interface{})
+		for tableName, table := range db.Tables {
+			fmt.Printf("处理表: %s.%s\n", dbName, tableName)
+
+			// 创建可序列化的表
+			serializableTable := struct {
+				Name       string           `json:"name"`
+				Database   string           `json:"database"`
+				Schema     model.Schema     `json:"schema"`
+				TagIndexes []model.TagIndex `json:"tagIndexes"`
+			}{
+				Name:       table.Name,
+				Database:   table.Database,
+				Schema:     table.Schema,
+				TagIndexes: table.TagIndexes,
+			}
+			serializableTables[tableName] = serializableTable
+		}
+
+		// 创建可序列化的数据库
+		serializableDB := struct {
+			Name            string                 `json:"name"`
+			RetentionPolicy model.RetentionPolicy  `json:"retentionPolicy"`
+			Tables          map[string]interface{} `json:"tables"`
+		}{
+			Name:            db.Name,
+			RetentionPolicy: db.RetentionPolicy,
+			Tables:          serializableTables,
+		}
+		serializableDatabases[dbName] = serializableDB
+	}
 
 	// 准备元数据
 	metadata := struct {
-		Databases map[string]*model.Database `json:"databases"`
+		Databases map[string]interface{} `json:"databases"`
 	}{
-		Databases: e.databases,
+		Databases: serializableDatabases,
 	}
 
 	// 序列化元数据
+	fmt.Printf("序列化元数据\n")
 	data, err := json.MarshalIndent(metadata, "", "  ")
 	if err != nil {
+		fmt.Printf("序列化元数据失败: %v\n", err)
 		return fmt.Errorf("failed to marshal metadata: %w", err)
 	}
+	fmt.Printf("序列化元数据成功，大小: %d 字节\n", len(data))
 
 	// 写入元数据文件
 	metadataPath := filepath.Join(e.dataDir, "metadata.json")
+	fmt.Printf("写入元数据文件: %s\n", metadataPath)
+
+	// 确保目录存在
+	metadataDir := filepath.Dir(metadataPath)
+	fmt.Printf("确保目录存在: %s\n", metadataDir)
+	if err := os.MkdirAll(metadataDir, 0755); err != nil {
+		fmt.Printf("创建元数据目录失败: %v\n", err)
+		return fmt.Errorf("failed to create metadata directory: %w", err)
+	}
+	fmt.Printf("目录已存在或创建成功\n")
+
+	// 检查目录是否可写
+	testFile := filepath.Join(metadataDir, "test.tmp")
+	fmt.Printf("检查目录是否可写: %s\n", testFile)
+	if err := os.WriteFile(testFile, []byte("test"), 0644); err != nil {
+		fmt.Printf("目录不可写: %v\n", err)
+		return fmt.Errorf("directory not writable: %w", err)
+	}
+	os.Remove(testFile)
+	fmt.Printf("目录可写\n")
+
+	// 写入元数据文件
+	fmt.Printf("写入元数据文件内容: %d 字节\n", len(data))
 	if err := os.WriteFile(metadataPath, data, 0644); err != nil {
+		fmt.Printf("写入元数据文件失败: %v\n", err)
 		return fmt.Errorf("failed to write metadata file: %w", err)
 	}
+	fmt.Printf("写入元数据文件成功\n")
 
+	// 验证文件是否成功写入
+	fmt.Printf("验证元数据文件是否成功写入\n")
+	if _, err := os.Stat(metadataPath); err != nil {
+		fmt.Printf("验证元数据文件失败: %v\n", err)
+		return fmt.Errorf("failed to verify metadata file: %w", err)
+	}
+	fmt.Printf("验证元数据文件成功\n")
+
+	fmt.Printf("元数据保存成功\n")
 	return nil
 }
 
@@ -347,18 +581,27 @@ func (e *StorageEngine) getOrCreateMemTable(dbName, tableName string) (*MemTable
 
 // CreateDatabase 创建数据库
 func (e *StorageEngine) CreateDatabase(name string, retentionPolicy model.RetentionPolicy) error {
+	fmt.Printf("开始创建数据库: %s\n", name)
+
 	e.mu.Lock()
-	defer e.mu.Unlock()
+	defer func() {
+		e.mu.Unlock()
+		fmt.Printf("CreateDatabase: 解锁完成\n")
+	}()
 
 	if _, exists := e.databases[name]; exists {
+		fmt.Printf("数据库 %s 已存在\n", name)
 		return fmt.Errorf("database %s already exists", name)
 	}
 
 	// 创建数据库目录
 	dbDir := filepath.Join(e.dataDir, name)
+	fmt.Printf("创建数据库目录: %s\n", dbDir)
 	if err := os.MkdirAll(dbDir, 0755); err != nil {
+		fmt.Printf("创建数据库目录失败: %v\n", err)
 		return fmt.Errorf("failed to create database directory: %w", err)
 	}
+	fmt.Printf("数据库目录创建成功\n")
 
 	// 创建数据库对象
 	db := &model.Database{
@@ -367,33 +610,47 @@ func (e *StorageEngine) CreateDatabase(name string, retentionPolicy model.Retent
 		Tables:          make(map[string]*model.Table),
 	}
 
+	fmt.Printf("添加数据库 %s 到映射\n", name)
 	e.databases[name] = db
+	fmt.Printf("数据库添加到映射成功\n")
 
 	// 保存元数据
-	if err := e.saveMetadata(); err != nil {
+	fmt.Printf("保存数据库 %s 的元数据\n", name)
+	if err := e.saveMetadata(true); err != nil {
+		fmt.Printf("保存数据库 %s 的元数据失败: %v\n", name, err)
+		// 回滚操作
+		delete(e.databases, name)
 		return fmt.Errorf("failed to save metadata: %w", err)
 	}
+	fmt.Printf("保存数据库 %s 的元数据成功\n", name)
 
+	fmt.Printf("数据库 %s 创建成功\n", name)
 	return nil
 }
 
 // CreateTable 创建表
 func (e *StorageEngine) CreateTable(dbName, tableName string, schema model.Schema, tagIndexes []model.TagIndex) error {
+	fmt.Printf("开始创建表 %s.%s\n", dbName, tableName)
+
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
 	db, exists := e.databases[dbName]
 	if !exists {
+		fmt.Printf("数据库 %s 不存在\n", dbName)
 		return fmt.Errorf("database %s does not exist", dbName)
 	}
 
 	if _, exists := db.Tables[tableName]; exists {
+		fmt.Printf("表 %s 已存在于数据库 %s 中\n", tableName, dbName)
 		return fmt.Errorf("table %s already exists in database %s", tableName, dbName)
 	}
 
 	// 创建表目录
 	tableDir := filepath.Join(e.dataDir, dbName, tableName)
+	fmt.Printf("创建表目录: %s\n", tableDir)
 	if err := os.MkdirAll(tableDir, 0755); err != nil {
+		fmt.Printf("创建表目录失败: %v\n", err)
 		return fmt.Errorf("failed to create table directory: %w", err)
 	}
 
@@ -405,50 +662,59 @@ func (e *StorageEngine) CreateTable(dbName, tableName string, schema model.Schem
 		TagIndexes: tagIndexes,
 	}
 
+	fmt.Printf("添加表 %s 到数据库 %s\n", tableName, dbName)
 	db.Tables[tableName] = table
 
 	// 创建索引
-	ctx := context.Background()
-	for _, tagIndex := range tagIndexes {
-		// 转换索引类型
-		var idxType index.IndexType
-		switch tagIndex.Type {
-		case "inverted":
-			idxType = index.IndexTypeInverted
-		case "btree":
-			idxType = index.IndexTypeBTree
-		case "bitmap":
-			idxType = index.IndexTypeBitmap
-		case "hash":
-			idxType = index.IndexTypeHash
-		case "composite":
-			idxType = index.IndexTypeComposite
-		default:
-			// 自动选择索引类型
-			idxType = 0
-		}
+	if tagIndexes != nil && len(tagIndexes) > 0 {
+		fmt.Printf("开始创建 %d 个标签索引\n", len(tagIndexes))
+		ctx := context.Background()
+		for _, tagIndex := range tagIndexes {
+			// 转换索引类型
+			var idxType index.IndexType
+			switch tagIndex.Type {
+			case "inverted":
+				idxType = index.IndexTypeInverted
+			case "btree":
+				idxType = index.IndexTypeBTree
+			case "bitmap":
+				idxType = index.IndexTypeBitmap
+			case "hash":
+				idxType = index.IndexTypeHash
+			case "composite":
+				idxType = index.IndexTypeComposite
+			default:
+				// 自动选择索引类型
+				idxType = 0
+			}
 
-		// 创建索引选项
-		options := index.IndexOptions{
-			Type:                idxType,
-			Name:                tagIndex.Name,
-			Unique:              tagIndex.Unique,
-			Fields:              tagIndex.Fields,
-			CardinalityEstimate: tagIndex.CardinalityEstimate,
-			SupportRange:        tagIndex.SupportRange,
-			SupportPrefix:       tagIndex.SupportPrefix,
-			SupportRegex:        tagIndex.SupportRegex,
-		}
+			// 创建索引选项
+			options := index.IndexOptions{
+				Type:                idxType,
+				Name:                tagIndex.Name,
+				Unique:              tagIndex.Unique,
+				Fields:              tagIndex.Fields,
+				CardinalityEstimate: tagIndex.CardinalityEstimate,
+				SupportRange:        tagIndex.SupportRange,
+				SupportPrefix:       tagIndex.SupportPrefix,
+				SupportRegex:        tagIndex.SupportRegex,
+			}
 
-		// 创建索引
-		_, err := e.indexMgr.CreateIndex(ctx, dbName, tableName, options)
-		if err != nil {
-			return fmt.Errorf("failed to create index %s: %w", tagIndex.Name, err)
+			fmt.Printf("创建索引 %s\n", tagIndex.Name)
+			// 创建索引
+			_, err := e.indexMgr.CreateIndex(ctx, dbName, tableName, options)
+			if err != nil {
+				fmt.Printf("创建索引 %s 失败: %v\n", tagIndex.Name, err)
+				return fmt.Errorf("failed to create index %s: %w", tagIndex.Name, err)
+			}
 		}
+	} else {
+		fmt.Printf("没有标签索引需要创建\n")
 	}
 
 	// 创建时间索引
 	if schema.TimeField != "" {
+		fmt.Printf("开始创建时间索引，时间字段: %s\n", schema.TimeField)
 		timeIndexOptions := index.TimeIndexOptions{
 			Name:      "time_idx",
 			TimeField: schema.TimeField,
@@ -464,17 +730,26 @@ func (e *StorageEngine) CreateTable(dbName, tableName string, schema model.Schem
 			Name:   "time_idx",
 			Fields: []string{schema.TimeField},
 		}
+
+		ctx := context.Background()
+		fmt.Printf("注册时间索引\n")
 		_, err := e.indexMgr.CreateIndex(ctx, dbName, tableName, options)
 		if err != nil {
+			fmt.Printf("创建时间索引失败: %v\n", err)
 			return fmt.Errorf("failed to create time index: %w", err)
 		}
+	} else {
+		fmt.Printf("没有时间字段，跳过创建时间索引\n")
 	}
 
 	// 保存元数据
-	if err := e.saveMetadata(); err != nil {
+	fmt.Printf("保存元数据\n")
+	if err := e.saveMetadata(true); err != nil {
+		fmt.Printf("保存元数据失败: %v\n", err)
 		return fmt.Errorf("failed to save metadata: %w", err)
 	}
 
+	fmt.Printf("表 %s.%s 创建成功\n", dbName, tableName)
 	return nil
 }
 
@@ -777,61 +1052,94 @@ func (e *StorageEngine) ListDatabases() ([]*model.Database, error) {
 
 // DropDatabase 删除数据库
 func (e *StorageEngine) DropDatabase(dbName string) error {
+	fmt.Printf("开始删除数据库: %s\n", dbName)
+
 	e.mu.Lock()
-	defer e.mu.Unlock()
+	defer func() {
+		e.mu.Unlock()
+		fmt.Printf("DropDatabase: 解锁完成\n")
+	}()
 
 	// 检查数据库是否存在
 	if _, exists := e.databases[dbName]; !exists {
+		fmt.Printf("数据库 %s 不存在\n", dbName)
 		return fmt.Errorf("database %s does not exist", dbName)
 	}
+	fmt.Printf("数据库 %s 存在，准备删除\n", dbName)
 
 	// 删除数据库目录
 	dbPath := filepath.Join(e.dataDir, dbName)
+	fmt.Printf("删除数据库目录: %s\n", dbPath)
 	if err := os.RemoveAll(dbPath); err != nil {
+		fmt.Printf("删除数据库目录失败: %v\n", err)
 		return fmt.Errorf("failed to remove database directory: %w", err)
 	}
+	fmt.Printf("数据库目录删除成功\n")
 
 	// 删除内存中的数据库对象
+	fmt.Printf("从内存中删除数据库对象\n")
 	delete(e.databases, dbName)
+	fmt.Printf("内存中的数据库对象删除成功\n")
 
 	// 保存元数据
-	if err := e.saveMetadata(); err != nil {
+	fmt.Printf("保存更新后的元数据\n")
+	if err := e.saveMetadata(true); err != nil {
+		fmt.Printf("保存元数据失败: %v\n", err)
 		return fmt.Errorf("failed to save metadata: %w", err)
 	}
+	fmt.Printf("元数据保存成功\n")
 
+	fmt.Printf("数据库 %s 删除成功\n", dbName)
 	return nil
 }
 
 // DropTable 删除表
 func (e *StorageEngine) DropTable(dbName, tableName string) error {
+	fmt.Printf("开始删除表: %s.%s\n", dbName, tableName)
+
 	e.mu.Lock()
-	defer e.mu.Unlock()
+	defer func() {
+		e.mu.Unlock()
+		fmt.Printf("DropTable: 解锁完成\n")
+	}()
 
 	// 检查数据库是否存在
 	db, exists := e.databases[dbName]
 	if !exists {
+		fmt.Printf("数据库 %s 不存在\n", dbName)
 		return fmt.Errorf("database %s does not exist", dbName)
 	}
 
 	// 检查表是否存在
 	if _, exists := db.Tables[tableName]; !exists {
+		fmt.Printf("表 %s 在数据库 %s 中不存在\n", tableName, dbName)
 		return fmt.Errorf("table %s does not exist in database %s", tableName, dbName)
 	}
+	fmt.Printf("表 %s.%s 存在，准备删除\n", dbName, tableName)
 
 	// 删除表目录
 	tablePath := filepath.Join(e.dataDir, dbName, tableName)
+	fmt.Printf("删除表目录: %s\n", tablePath)
 	if err := os.RemoveAll(tablePath); err != nil {
+		fmt.Printf("删除表目录失败: %v\n", err)
 		return fmt.Errorf("failed to remove table directory: %w", err)
 	}
+	fmt.Printf("表目录删除成功\n")
 
 	// 删除内存中的表对象
+	fmt.Printf("从内存中删除表对象\n")
 	delete(db.Tables, tableName)
+	fmt.Printf("内存中的表对象删除成功\n")
 
 	// 保存元数据
-	if err := e.saveMetadata(); err != nil {
+	fmt.Printf("保存更新后的元数据\n")
+	if err := e.saveMetadata(true); err != nil {
+		fmt.Printf("保存元数据失败: %v\n", err)
 		return fmt.Errorf("failed to save metadata: %w", err)
 	}
+	fmt.Printf("元数据保存成功\n")
 
+	fmt.Printf("表 %s.%s 删除成功\n", dbName, tableName)
 	return nil
 }
 
@@ -1901,4 +2209,88 @@ func getDirSize(path string) (int64, error) {
 		return nil
 	})
 	return size, err
+}
+
+// ClearTable 清空表中的所有数据
+func (e *StorageEngine) ClearTable(dbName, tableName string) error {
+	fmt.Printf("开始清空表: %s.%s\n", dbName, tableName)
+
+	// 第一阶段：获取锁，检查数据库和表是否存在，删除数据文件
+	e.mu.Lock()
+
+	// 检查数据库是否存在
+	db, exists := e.databases[dbName]
+	if !exists {
+		e.mu.Unlock()
+		fmt.Printf("数据库 %s 不存在\n", dbName)
+		return fmt.Errorf("database %s does not exist", dbName)
+	}
+
+	// 检查表是否存在
+	table, exists := db.Tables[tableName]
+	if !exists {
+		e.mu.Unlock()
+		fmt.Printf("表 %s 在数据库 %s 中不存在\n", tableName, dbName)
+		return fmt.Errorf("table %s does not exist in database %s", tableName, dbName)
+	}
+	fmt.Printf("表 %s.%s 存在，准备清空\n", dbName, tableName)
+
+	// 获取表的数据目录
+	tableDir := filepath.Join(e.dataDir, dbName, tableName)
+	fmt.Printf("表数据目录: %s\n", tableDir)
+
+	// 获取表中的数据文件
+	dataFiles, err := filepath.Glob(filepath.Join(tableDir, "*.data"))
+	if err != nil {
+		e.mu.Unlock()
+		fmt.Printf("获取数据文件失败: %v\n", err)
+		return fmt.Errorf("failed to get data files: %w", err)
+	}
+	fmt.Printf("找到 %d 个数据文件\n", len(dataFiles))
+
+	// 删除所有数据文件
+	for _, file := range dataFiles {
+		fmt.Printf("删除数据文件: %s\n", file)
+		if err := os.Remove(file); err != nil {
+			e.mu.Unlock()
+			fmt.Printf("删除数据文件失败: %v\n", err)
+			return fmt.Errorf("failed to remove data file %s: %w", file, err)
+		}
+	}
+	fmt.Printf("所有数据文件删除成功\n")
+
+	// 清空内存表
+	memTableKey := dbName + ":" + tableName
+	if memTable, exists := e.memTables[memTableKey]; exists {
+		fmt.Printf("清空内存表\n")
+		memTable.Clear()
+		fmt.Printf("内存表清空成功\n")
+	}
+
+	// 保存需要重建的索引
+	var tagIndexes []model.TagIndex
+	if len(table.TagIndexes) > 0 {
+		tagIndexes = make([]model.TagIndex, len(table.TagIndexes))
+		copy(tagIndexes, table.TagIndexes)
+	}
+
+	// 释放锁
+	e.mu.Unlock()
+	fmt.Printf("ClearTable: 第一阶段完成，释放锁\n")
+
+	// 第二阶段：重建索引（不需要锁）
+	if len(tagIndexes) > 0 {
+		fmt.Printf("重建索引\n")
+		for _, tagIndex := range tagIndexes {
+			fmt.Printf("重建索引: %s\n", tagIndex.Name)
+			if err := e.RebuildIndex(dbName, tableName, tagIndex.Name); err != nil {
+				fmt.Printf("重建索引失败: %v\n", err)
+				return fmt.Errorf("failed to rebuild index %s: %w", tagIndex.Name, err)
+			}
+		}
+		fmt.Printf("所有索引重建成功\n")
+	}
+
+	fmt.Printf("表 %s.%s 清空成功\n", dbName, tableName)
+	return nil
 }
