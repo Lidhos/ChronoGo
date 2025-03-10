@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"sort"
@@ -15,6 +16,8 @@ import (
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 
+	"ChronoGo/pkg/cluster"
+	"ChronoGo/pkg/cluster/common"
 	"ChronoGo/pkg/model"
 	"ChronoGo/pkg/protocol"
 	"ChronoGo/pkg/query"
@@ -22,9 +25,15 @@ import (
 )
 
 var (
-	dataDir   = flag.String("data-dir", "./data", "数据存储目录")
-	httpAddr  = flag.String("http-addr", ":8080", "HTTP服务地址")
-	mongoAddr = flag.String("mongo-addr", ":27017", "MongoDB协议服务地址")
+	dataDir       = flag.String("data-dir", "./data", "数据存储目录")
+	httpAddr      = flag.String("http-addr", ":8080", "HTTP服务地址")
+	mongoAddr     = flag.String("mongo-addr", ":27017", "MongoDB协议服务地址")
+	clusterID     = flag.String("cluster-id", "", "集群ID，为空时自动生成")
+	publicIP      = flag.String("public-ip", "", "节点对外服务的IP地址")
+	privateIP     = flag.String("private-ip", "", "节点内部通信的IP地址")
+	masterIP      = flag.String("master-ip", "", "主节点的IP地址，为空时表示自己是主节点")
+	secondIP      = flag.String("second-ip", "", "备用主节点的IP地址")
+	enableCluster = flag.Bool("enable-cluster", false, "是否启用集群模式")
 )
 
 func main() {
@@ -50,6 +59,47 @@ func main() {
 	cmdHandler := protocol.NewCommandHandler()
 	registerCommands(cmdHandler, storageEngine, queryEngine)
 
+	// 如果启用集群模式，初始化集群
+	var clusterManager common.ClusterManager
+	if *enableCluster {
+		// 创建集群配置
+		clusterConfig := cluster.NewClusterConfig()
+		clusterConfig.ClusterID = *clusterID
+		clusterConfig.DataDir = *dataDir
+		clusterConfig.PublicIP = *publicIP
+		clusterConfig.PrivateIP = *privateIP
+		clusterConfig.MasterIP = *masterIP
+		clusterConfig.SecondIP = *secondIP
+		clusterConfig.PublicPort = 27017  // MongoDB协议端口
+		clusterConfig.PrivatePort = 27018 // 集群内部通信端口
+
+		// 创建集群管理器
+		clusterManager, err = cluster.NewClusterManager(clusterConfig)
+		if err != nil {
+			log.Fatalf("Failed to create cluster manager: %v", err)
+		}
+
+		// 启动集群管理器
+		if err := clusterManager.Start(); err != nil {
+			log.Fatalf("Failed to start cluster manager: %v", err)
+		}
+		defer clusterManager.Stop()
+
+		// 获取集群信息
+		clusterInfo, err := clusterManager.GetClusterInfo()
+		if err != nil {
+			log.Printf("Warning: Failed to get cluster info: %v", err)
+		} else {
+			log.Printf("Cluster ID: %s, Status: %v, Nodes: %d",
+				clusterInfo.ClusterID,
+				clusterInfo.Status,
+				len(clusterInfo.DNodes))
+		}
+
+		// 注册集群相关命令
+		registerClusterCommands(cmdHandler, clusterManager)
+	}
+
 	// 启动MongoDB协议服务
 	wireHandler, err := protocol.NewWireProtocolHandler(*mongoAddr, cmdHandler)
 	if err != nil {
@@ -61,6 +111,9 @@ func main() {
 	// 打印启动信息
 	fmt.Printf("ChronoGo started\n")
 	fmt.Printf("MongoDB protocol server listening on %s\n", *mongoAddr)
+	if *enableCluster {
+		fmt.Printf("Cluster mode enabled\n")
+	}
 
 	// 等待信号
 	sigCh := make(chan os.Signal, 1)
@@ -950,6 +1003,142 @@ func registerCommands(handler *protocol.CommandHandler, storageEngine *storage.S
 				{"id", int64(0)},
 				{"ns", dbName + "." + tableName},
 			}},
+		}, nil
+	})
+}
+
+// registerClusterCommands 注册集群相关命令
+func registerClusterCommands(handler *protocol.CommandHandler, clusterManager common.ClusterManager) {
+	// 获取集群状态命令
+	handler.Register("getClusterStatus", func(ctx context.Context, cmd bson.D) (bson.D, error) {
+		// 获取集群信息
+		clusterInfo, err := clusterManager.GetClusterInfo()
+		if err != nil {
+			return nil, err
+		}
+
+		// 获取所有节点
+		dnodes, err := clusterManager.ListDNodes()
+		if err != nil {
+			return nil, err
+		}
+
+		// 构建节点列表
+		nodeList := make(bson.A, 0, len(dnodes))
+		for _, dnode := range dnodes {
+			nodeList = append(nodeList, bson.D{
+				{"nodeId", dnode.NodeID},
+				{"status", int(dnode.Status)},
+				{"role", int(dnode.Role)},
+				{"publicIp", dnode.PublicIP.String()},
+				{"privateIp", dnode.PrivateIP.String()},
+				{"cpuUsage", dnode.CPUUsage},
+				{"memoryUsage", dnode.MemoryUsage},
+				{"diskUsage", dnode.DiskUsage},
+				{"vnodeCount", len(dnode.VNodes)},
+			})
+		}
+
+		// 获取所有虚拟节点组
+		vgroups, err := clusterManager.ListVGroups()
+		if err != nil {
+			return nil, err
+		}
+
+		// 构建虚拟节点组列表
+		vgroupList := make(bson.A, 0, len(vgroups))
+		for _, vgroup := range vgroups {
+			vgroupList = append(vgroupList, bson.D{
+				{"vgroupId", vgroup.VGroupID},
+				{"database", vgroup.DatabaseName},
+				{"replicas", vgroup.Replicas},
+				{"vnodeCount", len(vgroup.VNodes)},
+				{"masterVnode", vgroup.MasterVNode},
+			})
+		}
+
+		return bson.D{
+			{"ok", 1},
+			{"clusterId", clusterInfo.ClusterID},
+			{"status", int(clusterInfo.Status)},
+			{"nodeCount", len(dnodes)},
+			{"vgroupCount", len(vgroups)},
+			{"nodes", nodeList},
+			{"vgroups", vgroupList},
+		}, nil
+	})
+
+	// 添加节点命令
+	handler.Register("addNode", func(ctx context.Context, cmd bson.D) (bson.D, error) {
+		// 解析参数
+		var publicIP, privateIP string
+		for _, elem := range cmd {
+			switch elem.Key {
+			case "publicIp":
+				if ip, ok := elem.Value.(string); ok {
+					publicIP = ip
+				}
+			case "privateIp":
+				if ip, ok := elem.Value.(string); ok {
+					privateIP = ip
+				}
+			}
+		}
+
+		if publicIP == "" {
+			return nil, fmt.Errorf("publicIp is required")
+		}
+
+		// 创建节点信息
+		nodeInfo := &common.DNodeInfo{
+			NodeInfo: common.NodeInfo{
+				NodeID:      primitive.NewObjectID().Hex(),
+				NodeType:    common.NodeTypeDNode,
+				Status:      common.NodeStatusOnline,
+				Role:        common.NodeRoleUnknown,
+				PublicIP:    net.ParseIP(publicIP),
+				PrivateIP:   net.ParseIP(privateIP),
+				PublicPort:  27017,
+				PrivatePort: 27018,
+				StartTime:   time.Now(),
+			},
+			VNodes: make([]string, 0),
+		}
+
+		// 添加节点
+		if err := clusterManager.AddDNode(nodeInfo); err != nil {
+			return nil, err
+		}
+
+		return bson.D{
+			{"ok", 1},
+			{"nodeId", nodeInfo.NodeID},
+		}, nil
+	})
+
+	// 移除节点命令
+	handler.Register("removeNode", func(ctx context.Context, cmd bson.D) (bson.D, error) {
+		// 解析参数
+		var nodeID string
+		for _, elem := range cmd {
+			if elem.Key == "nodeId" {
+				if id, ok := elem.Value.(string); ok {
+					nodeID = id
+				}
+			}
+		}
+
+		if nodeID == "" {
+			return nil, fmt.Errorf("nodeId is required")
+		}
+
+		// 移除节点
+		if err := clusterManager.RemoveDNode(nodeID); err != nil {
+			return nil, err
+		}
+
+		return bson.D{
+			{"ok", 1},
 		}, nil
 	})
 }
