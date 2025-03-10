@@ -46,9 +46,14 @@ type RetentionPolicy struct {
 
 // TagIndex 表示标签索引
 type TagIndex struct {
-	Name   string
-	TagKey string
-	Type   string // "hash", "btree"
+	Name                string   // 索引名称
+	Fields              []string // 索引字段（支持复合索引）
+	Type                string   // 索引类型: "inverted", "btree", "bitmap", "hash", "composite", "time", "auto"
+	Unique              bool     // 是否唯一索引
+	CardinalityEstimate int      // 基数估计（用于自动选择索引类型）
+	SupportRange        bool     // 是否支持范围查询
+	SupportPrefix       bool     // 是否支持前缀匹配
+	SupportRegex        bool     // 是否支持正则表达式
 }
 
 // TimeSeriesOptions 表示时序特有的集合配置

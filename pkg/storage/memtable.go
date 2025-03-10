@@ -214,3 +214,31 @@ func (mt *MemTable) ToJSON() ([]byte, error) {
 
 	return json.Marshal(points)
 }
+
+// GetAll 获取内存表中的所有数据点
+func (mt *MemTable) GetAll() []*model.TimeSeriesPoint {
+	mt.mu.RLock()
+	defer mt.mu.RUnlock()
+
+	// 获取所有数据点
+	dataList := mt.data.Range(0, 1<<63-1)
+
+	points := make([]*model.TimeSeriesPoint, 0, len(dataList))
+
+	// 反序列化每个数据点
+	for _, data := range dataList {
+		var doc bson.D
+		if err := bson.Unmarshal(data, &doc); err != nil {
+			continue
+		}
+
+		point, err := model.FromBSON(doc)
+		if err != nil {
+			continue
+		}
+
+		points = append(points, point)
+	}
+
+	return points
+}
