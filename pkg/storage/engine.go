@@ -349,3 +349,86 @@ func (e *StorageEngine) Close() error {
 
 	return nil
 }
+
+// ListDatabases 列出所有数据库
+func (e *StorageEngine) ListDatabases() ([]*model.Database, error) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	databases := make([]*model.Database, 0, len(e.databases))
+	for _, db := range e.databases {
+		databases = append(databases, db)
+	}
+	return databases, nil
+}
+
+// DropDatabase 删除数据库
+func (e *StorageEngine) DropDatabase(dbName string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	// 检查数据库是否存在
+	if _, exists := e.databases[dbName]; !exists {
+		return fmt.Errorf("database %s does not exist", dbName)
+	}
+
+	// 删除数据库中的所有表
+	for tableName := range e.databases[dbName].Tables {
+		// 删除内存表
+		delete(e.memTables, dbName+":"+tableName)
+
+		// TODO: 删除磁盘文件
+	}
+
+	// 删除数据库
+	delete(e.databases, dbName)
+
+	// TODO: 删除元数据文件
+
+	return nil
+}
+
+// DropTable 删除表
+func (e *StorageEngine) DropTable(dbName, tableName string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	// 检查数据库是否存在
+	db, exists := e.databases[dbName]
+	if !exists {
+		return fmt.Errorf("database %s does not exist", dbName)
+	}
+
+	// 检查表是否存在
+	if _, exists := db.Tables[tableName]; !exists {
+		return fmt.Errorf("table %s does not exist in database %s", tableName, dbName)
+	}
+
+	// 删除内存表
+	delete(e.memTables, dbName+":"+tableName)
+
+	// 删除表定义
+	delete(db.Tables, tableName)
+
+	// TODO: 删除磁盘文件
+
+	return nil
+}
+
+// ListTables 列出数据库中的所有表
+func (e *StorageEngine) ListTables(dbName string) ([]*model.Table, error) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	// 检查数据库是否存在
+	db, exists := e.databases[dbName]
+	if !exists {
+		return nil, fmt.Errorf("database %s does not exist", dbName)
+	}
+
+	tables := make([]*model.Table, 0, len(db.Tables))
+	for _, table := range db.Tables {
+		tables = append(tables, table)
+	}
+	return tables, nil
+}
