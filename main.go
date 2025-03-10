@@ -125,6 +125,56 @@ func main() {
 
 // registerCommands 注册命令处理函数
 func registerCommands(handler *protocol.CommandHandler, storageEngine *storage.StorageEngine, queryEngine *query.QueryEngine) {
+	// 添加ping命令支持
+	handler.Register("ping", func(ctx context.Context, cmd bson.D) (bson.D, error) {
+		return bson.D{{"ok", 1}}, nil
+	})
+
+	// 添加isMaster命令支持
+	handler.Register("isMaster", func(ctx context.Context, cmd bson.D) (bson.D, error) {
+		return bson.D{
+			{"ismaster", true},
+			{"maxBsonObjectSize", 16777216},
+			{"maxMessageSizeBytes", 48000000},
+			{"maxWriteBatchSize", 100000},
+			{"localTime", time.Now()},
+			{"maxWireVersion", 13},
+			{"minWireVersion", 0},
+			{"readOnly", false},
+			{"ok", 1},
+		}, nil
+	})
+
+	// 添加hello命令支持（MongoDB 5.0+中isMaster的替代命令）
+	handler.Register("hello", func(ctx context.Context, cmd bson.D) (bson.D, error) {
+		return bson.D{
+			{"ismaster", true},
+			{"maxBsonObjectSize", 16777216},
+			{"maxMessageSizeBytes", 48000000},
+			{"maxWriteBatchSize", 100000},
+			{"localTime", time.Now()},
+			{"maxWireVersion", 13},
+			{"minWireVersion", 0},
+			{"readOnly", false},
+			{"ok", 1},
+		}, nil
+	})
+
+	// 添加buildInfo命令支持
+	handler.Register("buildInfo", func(ctx context.Context, cmd bson.D) (bson.D, error) {
+		return bson.D{
+			{"version", "1.0.0"},
+			{"gitVersion", "ChronoGo-1.0.0"},
+			{"modules", bson.A{}},
+			{"sysInfo", "Go version go1.20 linux/amd64"},
+			{"versionArray", bson.A{1, 0, 0, 0}},
+			{"bits", 64},
+			{"debug", false},
+			{"maxBsonObjectSize", 16777216},
+			{"ok", 1},
+		}, nil
+	})
+
 	// 数据库管理命令
 	handler.Register("listDatabases", func(ctx context.Context, cmd bson.D) (bson.D, error) {
 		// 获取所有数据库
