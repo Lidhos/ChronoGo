@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+
+	"ChronoGo/pkg/logger"
 )
 
 // LockManager 管理存储引擎的锁
@@ -70,12 +72,12 @@ func (lm *LockManager) LockGlobal(write bool) func() {
 		}
 	} else {
 		if lm.debug {
-			fmt.Println("获取全局读锁")
+			logger.Printf("获取全局读锁")
 		}
 		lm.globalLock.RLock()
 		return func() {
 			if lm.debug {
-				fmt.Println("释放全局读锁")
+				logger.Printf("释放全局读锁")
 			}
 			lm.globalLock.RUnlock()
 		}
@@ -89,23 +91,23 @@ func (lm *LockManager) LockDatabase(dbName string, write bool) func() {
 
 	if write {
 		if lm.debug {
-			fmt.Printf("获取数据库 %s 写锁\n", dbName)
+			logger.Printf("获取数据库 %s 写锁", dbName)
 		}
 		lock.Lock()
 		return func() {
 			if lm.debug {
-				fmt.Printf("释放数据库 %s 写锁\n", dbName)
+				logger.Printf("释放数据库 %s 写锁", dbName)
 			}
 			lock.Unlock()
 		}
 	} else {
 		if lm.debug {
-			fmt.Printf("获取数据库 %s 读锁\n", dbName)
+			logger.Printf("获取数据库 %s 读锁", dbName)
 		}
 		lock.RLock()
 		return func() {
 			if lm.debug {
-				fmt.Printf("释放数据库 %s 读锁\n", dbName)
+				logger.Printf("释放数据库 %s 读锁", dbName)
 			}
 			lock.RUnlock()
 		}
@@ -119,23 +121,23 @@ func (lm *LockManager) LockTable(dbName, tableName string, write bool) func() {
 
 	if write {
 		if lm.debug {
-			fmt.Printf("获取表 %s.%s 写锁\n", dbName, tableName)
+			logger.Printf("获取表 %s.%s 写锁", dbName, tableName)
 		}
 		lock.Lock()
 		return func() {
 			if lm.debug {
-				fmt.Printf("释放表 %s.%s 写锁\n", dbName, tableName)
+				logger.Printf("释放表 %s.%s 写锁", dbName, tableName)
 			}
 			lock.Unlock()
 		}
 	} else {
 		if lm.debug {
-			fmt.Printf("获取表 %s.%s 读锁\n", dbName, tableName)
+			logger.Printf("获取表 %s.%s 读锁", dbName, tableName)
 		}
 		lock.RLock()
 		return func() {
 			if lm.debug {
-				fmt.Printf("释放表 %s.%s 读锁\n", dbName, tableName)
+				logger.Printf("释放表 %s.%s 读锁", dbName, tableName)
 			}
 			lock.RUnlock()
 		}

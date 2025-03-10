@@ -14,6 +14,7 @@ import (
 
 	"go.mongodb.org/mongo-driver/bson"
 
+	"ChronoGo/pkg/logger"
 	"ChronoGo/pkg/query"
 )
 
@@ -211,47 +212,43 @@ func (h *WireProtocolHandler) acceptLoop() {
 // handleSession 处理客户端会话
 func (h *WireProtocolHandler) handleSession(session *Session) {
 	defer func() {
-		// 关闭连接
-		session.Conn.Close()
-
-		// 移除会话
 		h.mu.Lock()
 		delete(h.sessions, session.ID)
 		h.mu.Unlock()
 
-		fmt.Printf("Client disconnected: %s (Session ID: %d)\n", session.Conn.RemoteAddr(), session.ID)
+		logger.Printf("Client disconnected: %s (Session ID: %d)", session.Conn.RemoteAddr(), session.ID)
 	}()
 
-	fmt.Printf("handleSession: 新客户端连接: %s (Session ID: %d)\n", session.Conn.RemoteAddr(), session.ID)
+	logger.Printf("handleSession: 新客户端连接: %s (Session ID: %d)", session.Conn.RemoteAddr(), session.ID)
 
 	buffer := make([]byte, 4096)
-	fmt.Printf("handleSession: 创建缓冲区，大小: %d 字节\n", len(buffer))
+	logger.Printf("handleSession: 创建缓冲区，大小: %d 字节", len(buffer))
 
 	for {
 		// 检查是否正在关闭
 		select {
 		case <-h.closing:
-			fmt.Printf("handleSession: 服务正在关闭，终止会话 %d\n", session.ID)
+			logger.Printf("handleSession: 服务正在关闭，终止会话 %d", session.ID)
 			return
 		default:
 		}
 
 		// 读取消息头
-		fmt.Printf("handleSession: 等待读取消息头...\n")
+		logger.Printf("handleSession: 等待读取消息头...")
 		headerBytes := make([]byte, 16)
 		_, err := io.ReadFull(session.Conn, headerBytes)
 		if err != nil {
 			if err != io.EOF {
-				fmt.Printf("handleSession: 读取消息头失败: %v\n", err)
+				logger.Printf("handleSession: 读取消息头失败: %v", err)
 			} else {
-				fmt.Printf("handleSession: 客户端断开连接 (EOF)\n")
+				logger.Printf("handleSession: 客户端断开连接 (EOF)")
 			}
 			return
 		}
 
 		// 更新会话活动时间
 		session.updateActivity()
-		fmt.Printf("handleSession: 更新会话活动时间\n")
+		logger.Printf("handleSession: 更新会话活动时间")
 
 		// 解析消息头
 		header := MsgHeader{
@@ -260,39 +257,39 @@ func (h *WireProtocolHandler) handleSession(session *Session) {
 			ResponseTo:    int32(binary.LittleEndian.Uint32(headerBytes[8:12])),
 			OpCode:        int32(binary.LittleEndian.Uint32(headerBytes[12:16])),
 		}
-		fmt.Printf("handleSession: 解析消息头: 长度=%d, RequestID=%d, ResponseTo=%d, OpCode=%d\n",
+		logger.Printf("handleSession: 解析消息头: 长度=%d, RequestID=%d, ResponseTo=%d, OpCode=%d",
 			header.MessageLength, header.RequestID, header.ResponseTo, header.OpCode)
 
 		// 检查消息长度
 		if header.MessageLength < 16 {
-			fmt.Printf("handleSession: 无效的消息长度: %d\n", header.MessageLength)
+			logger.Printf("handleSession: 无效的消息长度: %d", header.MessageLength)
 			return
 		}
 
 		// 读取消息体
 		bodyLength := header.MessageLength - 16
 		var body []byte
-		fmt.Printf("handleSession: 消息体长度: %d 字节\n", bodyLength)
+		logger.Printf("handleSession: 消息体长度: %d 字节", bodyLength)
 
 		if bodyLength > 0 {
 			// 如果消息体太大，需要扩展缓冲区
 			if bodyLength > int32(len(buffer)) {
-				fmt.Printf("handleSession: 消息体太大，创建新缓冲区，大小: %d 字节\n", bodyLength)
+				logger.Printf("handleSession: 消息体太大，创建新缓冲区，大小: %d 字节", bodyLength)
 				body = make([]byte, bodyLength)
 			} else {
-				fmt.Printf("handleSession: 使用现有缓冲区\n")
+				logger.Printf("handleSession: 使用现有缓冲区")
 				body = buffer[:bodyLength]
 			}
 
-			fmt.Printf("handleSession: 开始读取消息体...\n")
+			logger.Printf("handleSession: 开始读取消息体...")
 			_, err = io.ReadFull(session.Conn, body)
 			if err != nil {
-				fmt.Printf("handleSession: 读取消息体失败: %v\n", err)
+				logger.Printf("handleSession: 读取消息体失败: %v", err)
 				return
 			}
-			fmt.Printf("handleSession: 读取消息体成功，大小: %d 字节\n", len(body))
+			logger.Printf("handleSession: 读取消息体成功，大小: %d 字节", len(body))
 		} else {
-			fmt.Printf("handleSession: 消息没有消息体\n")
+			logger.Printf("handleSession: 消息没有消息体")
 		}
 
 		// 处理消息
@@ -300,89 +297,89 @@ func (h *WireProtocolHandler) handleSession(session *Session) {
 			Header: header,
 			Body:   body,
 		}
-		fmt.Printf("handleSession: 创建消息对象，准备处理\n")
+		logger.Printf("handleSession: 创建消息对象，准备处理")
 
-		fmt.Printf("handleSession: 开始处理消息 (RequestID: %d)\n", msg.Header.RequestID)
+		logger.Printf("handleSession: 开始处理消息 (RequestID: %d)", msg.Header.RequestID)
 		err = h.handleMessage(session, msg)
 		if err != nil {
-			fmt.Printf("handleSession: 处理消息失败: %v\n", err)
+			logger.Printf("handleSession: 处理消息失败: %v", err)
 			return
 		}
-		fmt.Printf("handleSession: 处理消息成功 (RequestID: %d)\n", msg.Header.RequestID)
+		logger.Printf("handleSession: 处理消息成功 (RequestID: %d)", msg.Header.RequestID)
 	}
 }
 
 // handleMessage 处理单个消息
 func (h *WireProtocolHandler) handleMessage(session *Session, msg *Message) error {
-	fmt.Printf("handleMessage: 开始处理消息 (RequestID: %d, OpCode: %d)\n", msg.Header.RequestID, msg.Header.OpCode)
+	logger.Printf("handleMessage: 开始处理消息 (RequestID: %d, OpCode: %d)", msg.Header.RequestID, msg.Header.OpCode)
 
 	switch msg.Header.OpCode {
 	case OpQuery:
-		fmt.Printf("handleMessage: 处理 OpQuery 消息\n")
+		logger.Printf("handleMessage: 处理 OpQuery 消息")
 		err := h.handleOpQuery(session, msg)
 		if err != nil {
-			fmt.Printf("handleMessage: OpQuery 处理失败: %v\n", err)
+			logger.Printf("handleMessage: OpQuery 处理失败: %v", err)
 			return err
 		}
-		fmt.Printf("handleMessage: OpQuery 处理成功\n")
+		logger.Printf("handleMessage: OpQuery 处理成功")
 		return nil
 	case OpGetMore:
-		fmt.Printf("handleMessage: 处理 OpGetMore 消息\n")
+		logger.Printf("handleMessage: 处理 OpGetMore 消息")
 		err := h.handleOpGetMore(session, msg)
 		if err != nil {
-			fmt.Printf("handleMessage: OpGetMore 处理失败: %v\n", err)
+			logger.Printf("handleMessage: OpGetMore 处理失败: %v", err)
 			return err
 		}
-		fmt.Printf("handleMessage: OpGetMore 处理成功\n")
+		logger.Printf("handleMessage: OpGetMore 处理成功")
 		return nil
 	case OpKillCursors:
-		fmt.Printf("handleMessage: 处理 OpKillCursors 消息\n")
+		logger.Printf("handleMessage: 处理 OpKillCursors 消息")
 		err := h.handleOpKillCursors(session, msg)
 		if err != nil {
-			fmt.Printf("handleMessage: OpKillCursors 处理失败: %v\n", err)
+			logger.Printf("handleMessage: OpKillCursors 处理失败: %v", err)
 			return err
 		}
-		fmt.Printf("handleMessage: OpKillCursors 处理成功\n")
+		logger.Printf("handleMessage: OpKillCursors 处理成功")
 		return nil
 	case OpInsert:
-		fmt.Printf("handleMessage: 处理 OpInsert 消息\n")
+		logger.Printf("handleMessage: 处理 OpInsert 消息")
 		err := h.handleOpInsert(session, msg)
 		if err != nil {
-			fmt.Printf("handleMessage: OpInsert 处理失败: %v\n", err)
+			logger.Printf("handleMessage: OpInsert 处理失败: %v", err)
 			return err
 		}
-		fmt.Printf("handleMessage: OpInsert 处理成功\n")
+		logger.Printf("handleMessage: OpInsert 处理成功")
 		return nil
 	case OpUpdate:
-		fmt.Printf("handleMessage: 处理 OpUpdate 消息\n")
+		logger.Printf("handleMessage: 处理 OpUpdate 消息")
 		err := h.handleOpUpdate(session, msg)
 		if err != nil {
-			fmt.Printf("handleMessage: OpUpdate 处理失败: %v\n", err)
+			logger.Printf("handleMessage: OpUpdate 处理失败: %v", err)
 			return err
 		}
-		fmt.Printf("handleMessage: OpUpdate 处理成功\n")
+		logger.Printf("handleMessage: OpUpdate 处理成功")
 		return nil
 	case OpDelete:
-		fmt.Printf("handleMessage: 处理 OpDelete 消息\n")
+		logger.Printf("handleMessage: 处理 OpDelete 消息")
 		err := h.handleOpDelete(session, msg)
 		if err != nil {
-			fmt.Printf("handleMessage: OpDelete 处理失败: %v\n", err)
+			logger.Printf("handleMessage: OpDelete 处理失败: %v", err)
 			return err
 		}
-		fmt.Printf("handleMessage: OpDelete 处理成功\n")
+		logger.Printf("handleMessage: OpDelete 处理成功")
 		return nil
 	case OpMsg:
-		fmt.Printf("handleMessage: 处理 OpMsg 消息\n")
+		logger.Printf("handleMessage: 处理 OpMsg 消息")
 		err := h.handleOpMsg(session, msg)
 		if err != nil {
-			fmt.Printf("handleMessage: OpMsg 处理失败: %v\n", err)
+			logger.Printf("handleMessage: OpMsg 处理失败: %v", err)
 			return err
 		}
-		fmt.Printf("handleMessage: OpMsg 处理成功\n")
+		logger.Printf("handleMessage: OpMsg 处理成功")
 		return nil
 	default:
 		// 不支持的操作码
-		fmt.Printf("handleMessage: 不支持的操作码: %d\n", msg.Header.OpCode)
+		logger.Printf("handleMessage: 不支持的操作码: %d", msg.Header.OpCode)
 		return fmt.Errorf("unsupported opcode: %d", msg.Header.OpCode)
 	}
 }
@@ -707,7 +704,7 @@ func (h *WireProtocolHandler) handleOpUpdate(session *Session, msg *Message) err
 	if err != nil {
 		// 记录错误，但不发送响应
 		// 因为旧版MongoDB协议中，update操作不返回响应
-		fmt.Printf("Update error: %v\n", err)
+		logger.Printf("Update error: %v", err)
 		return nil
 	}
 
@@ -777,7 +774,7 @@ func (h *WireProtocolHandler) handleOpDelete(session *Session, msg *Message) err
 	if err != nil {
 		// 记录错误，但不发送响应
 		// 因为旧版MongoDB协议中，delete操作不返回响应
-		fmt.Printf("Delete error: %v\n", err)
+		logger.Printf("Delete error: %v", err)
 		return nil
 	}
 
@@ -787,65 +784,65 @@ func (h *WireProtocolHandler) handleOpDelete(session *Session, msg *Message) err
 
 // handleOpMsg 处理消息操作(MongoDB 3.6+)
 func (h *WireProtocolHandler) handleOpMsg(session *Session, msg *Message) error {
-	fmt.Printf("开始处理OpMsg消息 (RequestID: %d)\n", msg.Header.RequestID)
+	logger.Printf("开始处理OpMsg消息 (RequestID: %d)", msg.Header.RequestID)
 
 	// 解析OpMsg消息
 	if len(msg.Body) < 4 {
-		fmt.Printf("无效的OpMsg消息: 消息体长度不足，实际长度: %d\n", len(msg.Body))
+		logger.Printf("无效的OpMsg消息: 消息体长度不足，实际长度: %d", len(msg.Body))
 		return fmt.Errorf("invalid opMsg message: body length too short")
 	}
 
 	// 读取标志位
 	flags := binary.LittleEndian.Uint32(msg.Body[0:4])
 	offset := 4
-	fmt.Printf("OpMsg标志位: %d\n", flags)
+	logger.Printf("OpMsg标志位: %d", flags)
 
 	// 检查消息格式
 	if (flags & 1) != 0 {
 		// 校验和存在，暂不支持
-		fmt.Printf("不支持带校验和的消息\n")
+		logger.Printf("不支持带校验和的消息")
 		return fmt.Errorf("checksum not supported")
 	}
 
 	// 读取第一个部分
 	if offset >= len(msg.Body) {
-		fmt.Printf("无效的OpMsg消息: 消息体不完整，offset=%d, 消息体长度=%d\n", offset, len(msg.Body))
+		logger.Printf("无效的OpMsg消息: 消息体不完整，offset=%d, 消息体长度=%d", offset, len(msg.Body))
 		return fmt.Errorf("invalid opMsg message: incomplete body")
 	}
 
 	// 检查部分类型
 	partType := msg.Body[offset]
 	offset++
-	fmt.Printf("OpMsg部分类型: %d\n", partType)
+	logger.Printf("OpMsg部分类型: %d", partType)
 
 	if partType != 0 {
-		fmt.Printf("不支持的部分类型: %d\n", partType)
+		logger.Printf("不支持的部分类型: %d", partType)
 		return fmt.Errorf("unsupported section type: %d", partType)
 	}
 
 	// 检查剩余数据是否足够
 	remainingBytes := len(msg.Body) - offset
 	if remainingBytes <= 0 {
-		fmt.Printf("无效的OpMsg消息: 没有足够的数据用于BSON文档，剩余字节数: %d\n", remainingBytes)
+		logger.Printf("无效的OpMsg消息: 没有足够的数据用于BSON文档，剩余字节数: %d", remainingBytes)
 		return fmt.Errorf("invalid opMsg message: not enough data for BSON document")
 	}
 
 	// 检查BSON文档长度
 	if remainingBytes < 5 {
-		fmt.Printf("无效的OpMsg消息: BSON文档长度不足，剩余字节数: %d\n", remainingBytes)
+		logger.Printf("无效的OpMsg消息: BSON文档长度不足，剩余字节数: %d", remainingBytes)
 		return fmt.Errorf("invalid opMsg message: BSON document too short")
 	}
 
 	// 获取BSON文档声明的长度
 	declaredLength := int(binary.LittleEndian.Uint32(msg.Body[offset : offset+4]))
-	fmt.Printf("BSON文档声明的长度: %d，实际剩余字节数: %d\n", declaredLength, remainingBytes)
+	logger.Printf("BSON文档声明的长度: %d，实际剩余字节数: %d", declaredLength, remainingBytes)
 
 	// 打印前20个字节的十六进制值，帮助调试
 	hexBytes := ""
 	for i := 0; i < min(20, remainingBytes); i++ {
 		hexBytes += fmt.Sprintf("%02x ", msg.Body[offset+i])
 	}
-	fmt.Printf("BSON文档前20个字节: %s\n", hexBytes)
+	logger.Printf("BSON文档前20个字节: %s", hexBytes)
 
 	// 尝试使用声明的长度解析文档
 	var doc bson.D
@@ -855,34 +852,34 @@ func (h *WireProtocolHandler) handleOpMsg(session *Session, msg *Message) error 
 		// 正常情况：声明的长度小于等于实际剩余字节数
 		err = bson.Unmarshal(msg.Body[offset:offset+declaredLength], &doc)
 		if err == nil {
-			fmt.Printf("使用声明的长度成功解析文档: %v\n", doc)
+			logger.Printf("使用声明的长度成功解析文档: %v", doc)
 		} else {
-			fmt.Printf("使用声明的长度解析文档失败: %v\n", err)
+			logger.Printf("使用声明的长度解析文档失败: %v", err)
 		}
 	} else {
 		// 异常情况：声明的长度大于实际剩余字节数或小于最小BSON文档长度
-		fmt.Printf("声明的长度异常，尝试使用全部剩余字节解析\n")
+		logger.Printf("声明的长度异常，尝试使用全部剩余字节解析")
 	}
 
 	// 如果使用声明的长度解析失败，尝试使用全部剩余字节
 	if err != nil || len(doc) == 0 {
 		err = bson.Unmarshal(msg.Body[offset:], &doc)
 		if err != nil {
-			fmt.Printf("使用全部剩余字节解析文档失败: %v\n", err)
+			logger.Printf("使用全部剩余字节解析文档失败: %v", err)
 
 			// 尝试查找有效的BSON文档
-			fmt.Printf("尝试查找有效的BSON文档...\n")
+			logger.Printf("尝试查找有效的BSON文档...")
 
 			// 尝试不同的偏移量
 			for tryOffset := offset; tryOffset < offset+min(20, remainingBytes); tryOffset++ {
 				if tryOffset+4 <= len(msg.Body) {
 					tryLength := int(binary.LittleEndian.Uint32(msg.Body[tryOffset : tryOffset+4]))
 					if tryLength >= 5 && tryLength <= remainingBytes-(tryOffset-offset) {
-						fmt.Printf("尝试偏移量 %d，长度 %d\n", tryOffset-offset, tryLength)
+						logger.Printf("尝试偏移量 %d，长度 %d", tryOffset-offset, tryLength)
 						var tryDoc bson.D
 						tryErr := bson.Unmarshal(msg.Body[tryOffset:tryOffset+tryLength], &tryDoc)
 						if tryErr == nil && len(tryDoc) > 0 {
-							fmt.Printf("在偏移量 %d 找到有效文档: %v\n", tryOffset-offset, tryDoc)
+							logger.Printf("在偏移量 %d 找到有效文档: %v", tryOffset-offset, tryDoc)
 							doc = tryDoc
 							err = nil
 							break
@@ -895,11 +892,11 @@ func (h *WireProtocolHandler) handleOpMsg(session *Session, msg *Message) error 
 				return fmt.Errorf("failed to unmarshal command document: %w", err)
 			}
 		} else {
-			fmt.Printf("使用全部剩余字节成功解析文档: %v\n", doc)
+			logger.Printf("使用全部剩余字节成功解析文档: %v", doc)
 		}
 	}
 
-	fmt.Printf("解析命令文档成功: %v\n", doc)
+	logger.Printf("解析命令文档成功: %v", doc)
 
 	// 创建查询上下文，并添加会话信息和引擎信息
 	ctx := context.Background()
@@ -916,13 +913,13 @@ func (h *WireProtocolHandler) handleOpMsg(session *Session, msg *Message) error 
 
 	// 添加请求ID到日志
 	cmdName := getCommandName(doc)
-	fmt.Printf("Received command: %v (RequestID: %d)\n", cmdName, msg.Header.RequestID)
+	logger.Printf("Received command: %v (RequestID: %d)", cmdName, msg.Header.RequestID)
 
 	// 执行命令
-	fmt.Printf("开始执行命令: %s\n", cmdName)
+	logger.Printf("开始执行命令: %s", cmdName)
 	result, err := h.cmdHandler.Execute(ctx, doc)
 	if err != nil {
-		fmt.Printf("Command execution error: %v\n", err)
+		logger.Printf("Command execution error: %v", err)
 		// 创建错误响应
 		errorDoc := bson.D{
 			{"ok", 0},
@@ -931,12 +928,12 @@ func (h *WireProtocolHandler) handleOpMsg(session *Session, msg *Message) error 
 		}
 
 		// 发送错误响应
-		fmt.Printf("发送错误响应: %v\n", errorDoc)
+		logger.Printf("发送错误响应: %v", errorDoc)
 		return h.sendOpMsg(session, msg.Header.RequestID, errorDoc)
 	}
 
 	// 发送成功响应
-	fmt.Printf("命令执行成功，发送响应: %v\n", result)
+	logger.Printf("命令执行成功，发送响应: %v", result)
 	return h.sendOpMsg(session, msg.Header.RequestID, result)
 }
 
@@ -950,20 +947,20 @@ func getCommandName(doc bson.D) string {
 
 // sendOpMsg 发送OpMsg响应
 func (h *WireProtocolHandler) sendOpMsg(session *Session, responseTo int32, document bson.D) error {
-	fmt.Printf("sendOpMsg: 开始发送响应 (ResponseTo: %d)\n", responseTo)
+	logger.Printf("sendOpMsg: 开始发送响应 (ResponseTo: %d)", responseTo)
 
 	// 序列化文档
 	docBytes, err := bson.Marshal(document)
 	if err != nil {
-		fmt.Printf("sendOpMsg: 序列化文档失败: %v\n", err)
+		logger.Printf("sendOpMsg: 序列化文档失败: %v", err)
 		return err
 	}
-	fmt.Printf("sendOpMsg: 序列化文档成功，大小: %d 字节\n", len(docBytes))
+	logger.Printf("sendOpMsg: 序列化文档成功，大小: %d 字节", len(docBytes))
 
 	// 计算消息长度
 	// 消息头(16) + 标志位(4) + 部分类型(1) + 文档长度
 	msgLen := 16 + 4 + 1 + len(docBytes)
-	fmt.Printf("sendOpMsg: 消息总长度: %d 字节\n", msgLen)
+	logger.Printf("sendOpMsg: 消息总长度: %d 字节", msgLen)
 
 	// 创建响应消息
 	response := Message{
@@ -975,7 +972,7 @@ func (h *WireProtocolHandler) sendOpMsg(session *Session, responseTo int32, docu
 		},
 		Body: make([]byte, msgLen-16),
 	}
-	fmt.Printf("sendOpMsg: 创建响应消息: RequestID=%d, ResponseTo=%d\n", response.Header.RequestID, response.Header.ResponseTo)
+	logger.Printf("sendOpMsg: 创建响应消息: RequestID=%d, ResponseTo=%d", response.Header.RequestID, response.Header.ResponseTo)
 
 	// 写入标志位(0)
 	binary.LittleEndian.PutUint32(response.Body[0:4], 0)
@@ -987,14 +984,14 @@ func (h *WireProtocolHandler) sendOpMsg(session *Session, responseTo int32, docu
 	copy(response.Body[5:], docBytes)
 
 	// 发送响应
-	fmt.Printf("sendOpMsg: 开始发送消息\n")
+	logger.Printf("sendOpMsg: 开始发送消息")
 	err = h.sendMessage(session, &response)
 	if err != nil {
-		fmt.Printf("sendOpMsg: 发送消息失败: %v\n", err)
+		logger.Printf("sendOpMsg: 发送消息失败: %v", err)
 		return err
 	}
 
-	fmt.Printf("sendOpMsg: 发送消息成功\n")
+	logger.Printf("sendOpMsg: 发送消息成功")
 	return nil
 }
 
@@ -1032,7 +1029,7 @@ func getBsonValue(doc bson.D, key string) (interface{}, error) {
 
 // sendReply 发送响应
 func (h *WireProtocolHandler) sendReply(session *Session, responseTo int32, documents []bson.D, flags int32, cursorID int64) error {
-	fmt.Printf("sendReply: 开始发送响应 (ResponseTo: %d, 文档数: %d, 标志位: %d, 游标ID: %d)\n",
+	logger.Printf("sendReply: 开始发送响应 (ResponseTo: %d, 文档数: %d, 标志位: %d, 游标ID: %d)",
 		responseTo, len(documents), flags, cursorID)
 
 	// 序列化文档
@@ -1040,17 +1037,17 @@ func (h *WireProtocolHandler) sendReply(session *Session, responseTo int32, docu
 	for i, doc := range documents {
 		b, err := bson.Marshal(doc)
 		if err != nil {
-			fmt.Printf("sendReply: 序列化文档 #%d 失败: %v\n", i, err)
+			logger.Printf("sendReply: 序列化文档 #%d 失败: %v", i, err)
 			return fmt.Errorf("failed to marshal document: %w", err)
 		}
 		docBytes = append(docBytes, b...)
-		fmt.Printf("sendReply: 文档 #%d 序列化成功，大小: %d 字节\n", i, len(b))
+		logger.Printf("sendReply: 文档 #%d 序列化成功，大小: %d 字节", i, len(b))
 	}
-	fmt.Printf("sendReply: 所有文档序列化完成，总大小: %d 字节\n", len(docBytes))
+	logger.Printf("sendReply: 所有文档序列化完成，总大小: %d 字节", len(docBytes))
 
 	// 计算消息长度
 	messageLength := 16 + 20 + len(docBytes)
-	fmt.Printf("sendReply: 消息总长度: %d 字节\n", messageLength)
+	logger.Printf("sendReply: 消息总长度: %d 字节", messageLength)
 
 	// 创建响应头
 	header := MsgHeader{
@@ -1059,7 +1056,7 @@ func (h *WireProtocolHandler) sendReply(session *Session, responseTo int32, docu
 		ResponseTo:    responseTo,
 		OpCode:        OpReply,
 	}
-	fmt.Printf("sendReply: 创建响应头: 长度=%d, RequestID=%d, ResponseTo=%d, OpCode=%d\n",
+	logger.Printf("sendReply: 创建响应头: 长度=%d, RequestID=%d, ResponseTo=%d, OpCode=%d",
 		header.MessageLength, header.RequestID, header.ResponseTo, header.OpCode)
 
 	// 创建响应体
@@ -1069,7 +1066,7 @@ func (h *WireProtocolHandler) sendReply(session *Session, responseTo int32, docu
 	binary.LittleEndian.PutUint32(body[12:16], uint32(0)) // 起始位置
 	binary.LittleEndian.PutUint32(body[16:20], uint32(len(documents)))
 	copy(body[20:], docBytes)
-	fmt.Printf("sendReply: 创建响应体，大小: %d 字节\n", len(body))
+	logger.Printf("sendReply: 创建响应体，大小: %d 字节", len(body))
 
 	// 发送响应
 	headerBytes := make([]byte, 16)
@@ -1077,26 +1074,26 @@ func (h *WireProtocolHandler) sendReply(session *Session, responseTo int32, docu
 	binary.LittleEndian.PutUint32(headerBytes[4:8], uint32(header.RequestID))
 	binary.LittleEndian.PutUint32(headerBytes[8:12], uint32(header.ResponseTo))
 	binary.LittleEndian.PutUint32(headerBytes[12:16], uint32(header.OpCode))
-	fmt.Printf("sendReply: 序列化响应头完成\n")
+	logger.Printf("sendReply: 序列化响应头完成")
 
 	session.mu.Lock()
 	defer session.mu.Unlock()
 
-	fmt.Printf("sendReply: 开始发送响应头\n")
+	logger.Printf("sendReply: 开始发送响应头")
 	if _, err := session.Conn.Write(headerBytes); err != nil {
-		fmt.Printf("sendReply: 发送响应头失败: %v\n", err)
+		logger.Printf("sendReply: 发送响应头失败: %v", err)
 		return fmt.Errorf("failed to write header: %w", err)
 	}
-	fmt.Printf("sendReply: 发送响应头成功\n")
+	logger.Printf("sendReply: 发送响应头成功")
 
-	fmt.Printf("sendReply: 开始发送响应体\n")
+	logger.Printf("sendReply: 开始发送响应体")
 	if _, err := session.Conn.Write(body); err != nil {
-		fmt.Printf("sendReply: 发送响应体失败: %v\n", err)
+		logger.Printf("sendReply: 发送响应体失败: %v", err)
 		return fmt.Errorf("failed to write body: %w", err)
 	}
-	fmt.Printf("sendReply: 发送响应体成功\n")
+	logger.Printf("sendReply: 发送响应体成功")
 
-	fmt.Printf("sendReply: 响应发送完成\n")
+	logger.Printf("sendReply: 响应发送完成")
 	return nil
 }
 
@@ -1141,16 +1138,16 @@ func (h *CommandHandler) Register(name string, fn CommandFunc) {
 
 // Execute 执行命令
 func (h *CommandHandler) Execute(ctx context.Context, cmd bson.D) (bson.D, error) {
-	fmt.Printf("CommandHandler.Execute: 开始执行命令\n")
+	logger.Printf("CommandHandler.Execute: 开始执行命令")
 
 	if len(cmd) == 0 {
-		fmt.Printf("CommandHandler.Execute: 空命令\n")
+		logger.Printf("CommandHandler.Execute: 空命令")
 		return nil, fmt.Errorf("empty command")
 	}
 
 	// 获取命令名称
 	cmdName := strings.ToLower(cmd[0].Key)
-	fmt.Printf("CommandHandler.Execute: 原始命令名称: %s\n", cmdName)
+	logger.Printf("CommandHandler.Execute: 原始命令名称: %s", cmdName)
 
 	// 处理命令别名
 	originalName := cmdName
@@ -1186,7 +1183,7 @@ func (h *CommandHandler) Execute(ctx context.Context, cmd bson.D) (bson.D, error
 	}
 
 	if originalName != cmdName {
-		fmt.Printf("CommandHandler.Execute: 标准化命令名称: %s -> %s\n", originalName, cmdName)
+		logger.Printf("CommandHandler.Execute: 标准化命令名称: %s -> %s", originalName, cmdName)
 	}
 
 	// 查找命令处理函数
@@ -1196,26 +1193,26 @@ func (h *CommandHandler) Execute(ctx context.Context, cmd bson.D) (bson.D, error
 
 	if !ok {
 		// 尝试查找小写版本
-		fmt.Printf("CommandHandler.Execute: 命令 %s 未找到，尝试查找小写版本\n", cmdName)
+		logger.Printf("CommandHandler.Execute: 命令 %s 未找到，尝试查找小写版本", cmdName)
 		h.mu.RLock()
 		fn, ok = h.commands[strings.ToLower(cmdName)]
 		h.mu.RUnlock()
 
 		if !ok {
-			fmt.Printf("CommandHandler.Execute: 未知命令: %s\n", cmdName)
+			logger.Printf("CommandHandler.Execute: 未知命令: %s", cmdName)
 			return nil, fmt.Errorf("unknown command: %s", cmdName)
 		}
 	}
 
 	// 执行命令
-	fmt.Printf("CommandHandler.Execute: 找到命令处理函数，开始执行: %s\n", cmdName)
+	logger.Printf("CommandHandler.Execute: 找到命令处理函数，开始执行: %s", cmdName)
 	result, err := fn(ctx, cmd)
 	if err != nil {
-		fmt.Printf("CommandHandler.Execute: 命令执行失败: %v\n", err)
+		logger.Printf("CommandHandler.Execute: 命令执行失败: %v", err)
 		return nil, err
 	}
 
-	fmt.Printf("CommandHandler.Execute: 命令执行成功: %s\n", cmdName)
+	logger.Printf("CommandHandler.Execute: 命令执行成功: %s", cmdName)
 	return result, nil
 }
 
@@ -2340,7 +2337,7 @@ func (h *CommandHandler) RegisterTimeSeriesCommands() {
 
 // sendMessage 发送消息到客户端
 func (h *WireProtocolHandler) sendMessage(session *Session, msg *Message) error {
-	fmt.Printf("sendMessage: 开始发送消息 (RequestID: %d, ResponseTo: %d)\n", msg.Header.RequestID, msg.Header.ResponseTo)
+	logger.Printf("sendMessage: 开始发送消息 (RequestID: %d, ResponseTo: %d)", msg.Header.RequestID, msg.Header.ResponseTo)
 
 	// 序列化消息头
 	headerBytes := make([]byte, 16)
@@ -2348,28 +2345,28 @@ func (h *WireProtocolHandler) sendMessage(session *Session, msg *Message) error 
 	binary.LittleEndian.PutUint32(headerBytes[4:], uint32(msg.Header.RequestID))
 	binary.LittleEndian.PutUint32(headerBytes[8:], uint32(msg.Header.ResponseTo))
 	binary.LittleEndian.PutUint32(headerBytes[12:], uint32(msg.Header.OpCode))
-	fmt.Printf("sendMessage: 序列化消息头: 长度=%d, RequestID=%d, ResponseTo=%d, OpCode=%d\n",
+	logger.Printf("sendMessage: 序列化消息头: 长度=%d, RequestID=%d, ResponseTo=%d, OpCode=%d",
 		msg.Header.MessageLength, msg.Header.RequestID, msg.Header.ResponseTo, msg.Header.OpCode)
 
 	// 发送消息头
-	fmt.Printf("sendMessage: 开始发送消息头\n")
+	logger.Printf("sendMessage: 开始发送消息头")
 	_, err := session.Conn.Write(headerBytes)
 	if err != nil {
-		fmt.Printf("sendMessage: 发送消息头失败: %v\n", err)
+		logger.Printf("sendMessage: 发送消息头失败: %v", err)
 		return err
 	}
-	fmt.Printf("sendMessage: 发送消息头成功\n")
+	logger.Printf("sendMessage: 发送消息头成功")
 
 	// 发送消息体
-	fmt.Printf("sendMessage: 开始发送消息体，大小: %d 字节\n", len(msg.Body))
+	logger.Printf("sendMessage: 开始发送消息体，大小: %d 字节", len(msg.Body))
 	_, err = session.Conn.Write(msg.Body)
 	if err != nil {
-		fmt.Printf("sendMessage: 发送消息体失败: %v\n", err)
+		logger.Printf("sendMessage: 发送消息体失败: %v", err)
 		return err
 	}
-	fmt.Printf("sendMessage: 发送消息体成功\n")
+	logger.Printf("sendMessage: 发送消息体成功")
 
-	fmt.Printf("sendMessage: 消息发送完成\n")
+	logger.Printf("sendMessage: 消息发送完成")
 	return nil
 }
 
@@ -2414,10 +2411,10 @@ func (session *Session) getCursor(cursorID int64) *Cursor {
 	session.mu.Lock()
 	defer session.mu.Unlock()
 
-	fmt.Printf("Session %d: 尝试获取游标 %d\n", session.ID, cursorID)
+	logger.Printf("Session %d: 尝试获取游标 %d", session.ID, cursorID)
 
 	if session.cursorMap == nil {
-		fmt.Printf("Session %d: 游标映射为空\n", session.ID)
+		logger.Printf("Session %d: 游标映射为空", session.ID)
 		return nil
 	}
 
@@ -2425,10 +2422,10 @@ func (session *Session) getCursor(cursorID int64) *Cursor {
 	if cursor != nil {
 		// 更新游标最后使用时间
 		cursor.LastUsed = time.Now()
-		fmt.Printf("Session %d: 找到游标 %d，更新最后使用时间为 %v\n",
+		logger.Printf("Session %d: 找到游标 %d，更新最后使用时间为 %v",
 			session.ID, cursorID, cursor.LastUsed.Format(time.RFC3339))
 	} else {
-		fmt.Printf("Session %d: 游标 %d 不存在\n", session.ID, cursorID)
+		logger.Printf("Session %d: 游标 %d 不存在", session.ID, cursorID)
 	}
 
 	return cursor
@@ -2439,17 +2436,17 @@ func (session *Session) removeCursor(cursorID int64) {
 	session.mu.Lock()
 	defer session.mu.Unlock()
 
-	fmt.Printf("Session %d: 尝试移除游标 %d\n", session.ID, cursorID)
+	logger.Printf("Session %d: 尝试移除游标 %d", session.ID, cursorID)
 
 	if session.cursorMap != nil {
 		if _, exists := session.cursorMap[cursorID]; exists {
 			delete(session.cursorMap, cursorID)
-			fmt.Printf("Session %d: 成功移除游标 %d\n", session.ID, cursorID)
+			logger.Printf("Session %d: 成功移除游标 %d", session.ID, cursorID)
 		} else {
-			fmt.Printf("Session %d: 游标 %d 不存在，无需移除\n", session.ID, cursorID)
+			logger.Printf("Session %d: 游标 %d 不存在，无需移除", session.ID, cursorID)
 		}
 	} else {
-		fmt.Printf("Session %d: 游标映射为空，无法移除游标 %d\n", session.ID, cursorID)
+		logger.Printf("Session %d: 游标映射为空，无法移除游标 %d", session.ID, cursorID)
 	}
 }
 
@@ -2518,7 +2515,7 @@ func (session *Session) updateActivity() {
 	session.mu.Lock()
 	defer session.mu.Unlock()
 	session.lastActive = time.Now()
-	fmt.Printf("Session %d: 更新活动时间为 %v\n", session.ID, session.lastActive.Format(time.RFC3339))
+	logger.Printf("Session %d: 更新活动时间为 %v", session.ID, session.lastActive.Format(time.RFC3339))
 }
 
 // cleanupCursors 清理过期的游标
@@ -2566,12 +2563,12 @@ func (h *WireProtocolHandler) cleanupCursorsAndSessions() {
 		// 清理过期的游标
 		count := session.cleanupCursors(h.cursorTTL)
 		if count > 0 {
-			fmt.Printf("Cleaned up %d expired cursors for session %d\n", count, id)
+			logger.Printf("Cleaned up %d expired cursors for session %d", count, id)
 		}
 
 		// 如果会话已经超时，则关闭并删除
 		if now.Sub(session.lastActive) > sessionTimeout {
-			fmt.Printf("Closing inactive session %d\n", id)
+			logger.Printf("Closing inactive session %d", id)
 			session.Conn.Close()
 			delete(h.sessions, id)
 		}

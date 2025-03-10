@@ -19,6 +19,7 @@ import (
 	"go.mongodb.org/mongo-driver/bson"
 
 	"ChronoGo/pkg/index"
+	"ChronoGo/pkg/logger"
 	"ChronoGo/pkg/model"
 )
 
@@ -114,19 +115,13 @@ func NewQueryOptimizer(engine *StorageEngine) *QueryOptimizer {
 
 // loadMetadata 加载元数据
 func (e *StorageEngine) loadMetadata() error {
-	fmt.Println("开始加载元数据")
-
-	// 获取全局写锁
-	unlock := e.lockManager.LockGlobal(true)
-	defer unlock()
-
 	// 读取元数据文件
 	metadataPath := filepath.Join(e.dataDir, "metadata.json")
-	fmt.Printf("读取元数据文件: %s\n", metadataPath)
+	logger.Printf("读取元数据文件: %s", metadataPath)
 
 	// 检查文件是否存在
 	if _, err := os.Stat(metadataPath); os.IsNotExist(err) {
-		fmt.Println("元数据文件不存在，使用空数据库")
+		logger.Printf("元数据文件不存在，使用空数据库")
 		return nil
 	}
 
@@ -137,7 +132,7 @@ func (e *StorageEngine) loadMetadata() error {
 	}
 
 	// 解析元数据
-	fmt.Println("解析元数据")
+	logger.Printf("解析元数据")
 	var metadata struct {
 		Databases map[string]map[string]interface{} `json:"databases"`
 	}
@@ -147,7 +142,7 @@ func (e *StorageEngine) loadMetadata() error {
 
 	// 加载数据库
 	for dbName, dbMap := range metadata.Databases {
-		fmt.Printf("加载数据库: %s\n", dbName)
+		logger.Printf("加载数据库: %s", dbName)
 
 		// 创建数据库对象
 		db := &model.Database{
@@ -168,11 +163,11 @@ func (e *StorageEngine) loadMetadata() error {
 		// 解析表
 		if tablesData, ok := dbMap["tables"].(map[string]interface{}); ok {
 			for tableName, tableData := range tablesData {
-				fmt.Printf("加载表: %s.%s\n", dbName, tableName)
+				logger.Printf("加载表: %s.%s", dbName, tableName)
 
 				tableMap, ok := tableData.(map[string]interface{})
 				if !ok {
-					fmt.Printf("表 %s.%s 格式不正确\n", dbName, tableName)
+					logger.Printf("表 %s.%s 格式不正确", dbName, tableName)
 					continue
 				}
 
@@ -252,7 +247,7 @@ func (e *StorageEngine) loadMetadata() error {
 	}
 
 	// 重新创建索引
-	fmt.Printf("重新创建索引\n")
+	logger.Printf("重新创建索引")
 	ctx := context.Background()
 	for dbName, db := range e.databases {
 		for tableName, table := range db.Tables {
@@ -288,17 +283,17 @@ func (e *StorageEngine) loadMetadata() error {
 				}
 
 				// 创建索引
-				fmt.Printf("创建索引: %s.%s.%s\n", dbName, tableName, tagIndex.Name)
+				logger.Printf("创建索引: %s.%s.%s", dbName, tableName, tagIndex.Name)
 				_, err := e.indexMgr.CreateIndex(ctx, dbName, tableName, options)
 				if err != nil {
-					fmt.Printf("创建索引失败: %v\n", err)
+					logger.Printf("创建索引失败: %v", err)
 					// 继续处理其他索引
 				}
 			}
 
 			// 创建时间索引
 			if table.Schema.TimeField != "" {
-				fmt.Printf("创建时间索引: %s.%s.time_idx\n", dbName, tableName)
+				logger.Printf("创建时间索引: %s.%s.time_idx", dbName, tableName)
 				options := index.IndexOptions{
 					Type:   index.IndexTypeBTree,
 					Name:   "time_idx",
@@ -306,26 +301,26 @@ func (e *StorageEngine) loadMetadata() error {
 				}
 				_, err := e.indexMgr.CreateIndex(ctx, dbName, tableName, options)
 				if err != nil {
-					fmt.Printf("创建时间索引失败: %v\n", err)
+					logger.Printf("创建时间索引失败: %v", err)
 					// 继续处理其他表
 				}
 			}
 		}
 	}
 
-	fmt.Printf("元数据加载完成\n")
+	logger.Printf("元数据加载完成")
 	return nil
 }
 
 // saveMetadata 保存元数据
 func (e *StorageEngine) saveMetadata(alreadyLocked ...bool) error {
-	fmt.Printf("开始保存元数据\n")
+	logger.Printf("开始保存元数据")
 
 	// 检查是否已经持有锁
 	isAlreadyLocked := false
 	if len(alreadyLocked) > 0 && alreadyLocked[0] {
 		isAlreadyLocked = true
-		fmt.Printf("saveMetadata: 调用者已持有锁，跳过加锁\n")
+		logger.Printf("saveMetadata: 调用者已持有锁，跳过加锁")
 	}
 
 	// 如果没有持有锁，则获取全局读锁
@@ -334,19 +329,19 @@ func (e *StorageEngine) saveMetadata(alreadyLocked ...bool) error {
 		unlock = e.lockManager.LockGlobal(false)
 		defer func() {
 			unlock()
-			fmt.Printf("saveMetadata: 解锁完成\n")
+			logger.Printf("saveMetadata: 解锁完成")
 		}()
 	}
 
 	// 创建可序列化的数据库映射
 	serializableDatabases := make(map[string]interface{})
 	for dbName, db := range e.databases {
-		fmt.Printf("处理数据库: %s\n", dbName)
+		logger.Printf("处理数据库: %s", dbName)
 
 		// 创建可序列化的表映射
 		serializableTables := make(map[string]interface{})
 		for tableName, table := range db.Tables {
-			fmt.Printf("处理表: %s.%s\n", dbName, tableName)
+			logger.Printf("处理表: %s.%s", dbName, tableName)
 
 			// 创建可序列化的表
 			serializableTable := struct {
@@ -384,54 +379,54 @@ func (e *StorageEngine) saveMetadata(alreadyLocked ...bool) error {
 	}
 
 	// 序列化元数据
-	fmt.Printf("序列化元数据\n")
+	logger.Printf("序列化元数据")
 	data, err := json.MarshalIndent(metadata, "", "  ")
 	if err != nil {
-		fmt.Printf("序列化元数据失败: %v\n", err)
+		logger.Printf("序列化元数据失败: %v", err)
 		return fmt.Errorf("failed to marshal metadata: %w", err)
 	}
-	fmt.Printf("序列化元数据成功，大小: %d 字节\n", len(data))
+	logger.Printf("序列化元数据成功，大小: %d 字节", len(data))
 
 	// 写入元数据文件
 	metadataPath := filepath.Join(e.dataDir, "metadata.json")
-	fmt.Printf("写入元数据文件: %s\n", metadataPath)
+	logger.Printf("写入元数据文件: %s", metadataPath)
 
 	// 确保目录存在
 	metadataDir := filepath.Dir(metadataPath)
-	fmt.Printf("确保目录存在: %s\n", metadataDir)
+	logger.Printf("确保目录存在: %s", metadataDir)
 	if err := os.MkdirAll(metadataDir, 0755); err != nil {
-		fmt.Printf("创建元数据目录失败: %v\n", err)
+		logger.Printf("创建元数据目录失败: %v", err)
 		return fmt.Errorf("failed to create metadata directory: %w", err)
 	}
-	fmt.Printf("目录已存在或创建成功\n")
+	logger.Printf("目录已存在或创建成功")
 
 	// 检查目录是否可写
 	testFile := filepath.Join(metadataDir, "test.tmp")
-	fmt.Printf("检查目录是否可写: %s\n", testFile)
+	logger.Printf("检查目录是否可写: %s", testFile)
 	if err := os.WriteFile(testFile, []byte("test"), 0644); err != nil {
-		fmt.Printf("目录不可写: %v\n", err)
+		logger.Printf("目录不可写: %v", err)
 		return fmt.Errorf("directory not writable: %w", err)
 	}
 	os.Remove(testFile)
-	fmt.Printf("目录可写\n")
+	logger.Printf("目录可写")
 
 	// 写入元数据文件
-	fmt.Printf("写入元数据文件内容: %d 字节\n", len(data))
+	logger.Printf("写入元数据文件内容: %d 字节", len(data))
 	if err := os.WriteFile(metadataPath, data, 0644); err != nil {
-		fmt.Printf("写入元数据文件失败: %v\n", err)
+		logger.Printf("写入元数据文件失败: %v", err)
 		return fmt.Errorf("failed to write metadata file: %w", err)
 	}
-	fmt.Printf("写入元数据文件成功\n")
+	logger.Printf("写入元数据文件成功")
 
 	// 验证文件是否成功写入
-	fmt.Printf("验证元数据文件是否成功写入\n")
+	logger.Printf("验证元数据文件是否成功写入")
 	if _, err := os.Stat(metadataPath); err != nil {
-		fmt.Printf("验证元数据文件失败: %v\n", err)
+		logger.Printf("验证元数据文件失败: %v", err)
 		return fmt.Errorf("failed to verify metadata file: %w", err)
 	}
-	fmt.Printf("验证元数据文件成功\n")
+	logger.Printf("验证元数据文件成功")
 
-	fmt.Printf("元数据保存成功\n")
+	logger.Printf("元数据保存成功")
 	return nil
 }
 
