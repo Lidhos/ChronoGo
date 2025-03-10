@@ -56,8 +56,24 @@ func main() {
 	queryEngine := query.NewQueryEngine(storageEngine)
 
 	// 创建命令处理器
-	cmdHandler := protocol.NewCommandHandler()
-	registerCommands(cmdHandler, storageEngine, queryEngine)
+	commandHandler := protocol.NewCommandHandler()
+
+	// 创建协议处理器
+	wireHandler, err := protocol.NewWireProtocolHandler(*mongoAddr, commandHandler)
+	if err != nil {
+		log.Fatalf("创建协议处理器失败: %v", err)
+	}
+
+	// 设置存储引擎和查询引擎
+	wireHandler.SetStorageEngine(storageEngine)
+	wireHandler.SetQueryEngine(queryEngine)
+
+	// 注册命令
+	registerCommands(commandHandler, storageEngine, queryEngine)
+
+	// 启动协议处理器
+	go wireHandler.Start()
+	defer wireHandler.Close()
 
 	// 如果启用集群模式，初始化集群
 	var clusterManager common.ClusterManager
@@ -97,16 +113,8 @@ func main() {
 		}
 
 		// 注册集群相关命令
-		registerClusterCommands(cmdHandler, clusterManager)
+		registerClusterCommands(commandHandler, clusterManager)
 	}
-
-	// 启动MongoDB协议服务
-	wireHandler, err := protocol.NewWireProtocolHandler(*mongoAddr, cmdHandler)
-	if err != nil {
-		log.Fatalf("Failed to create wire protocol handler: %v", err)
-	}
-	wireHandler.Start()
-	defer wireHandler.Close()
 
 	// 打印启动信息
 	fmt.Printf("ChronoGo started\n")
@@ -163,7 +171,7 @@ func registerCommands(handler *protocol.CommandHandler, storageEngine *storage.S
 	// 添加buildInfo命令支持
 	handler.Register("buildInfo", func(ctx context.Context, cmd bson.D) (bson.D, error) {
 		return bson.D{
-			{"version", "1.0.0"},
+			{"version", "5.0.0"},
 			{"gitVersion", "ChronoGo-1.0.0"},
 			{"modules", bson.A{}},
 			{"sysInfo", "Go version go1.20 linux/amd64"},
@@ -185,19 +193,34 @@ func registerCommands(handler *protocol.CommandHandler, storageEngine *storage.S
 
 		// 构建数据库列表
 		dbList := make(bson.A, 0, len(databases))
+		var totalSize int64
+
 		for _, db := range databases {
+			// 获取数据库大小
+			dbSize, err := storageEngine.GetDatabaseSize(db.Name)
+			if err != nil {
+				// 如果获取大小失败，记录错误但继续处理
+				log.Printf("获取数据库 %s 大小失败: %v", db.Name, err)
+				dbSize = 0
+			}
+
+			totalSize += dbSize
+
 			dbList = append(dbList, bson.D{
 				{"name", db.Name},
-				{"sizeOnDisk", int64(0)}, // TODO: 实现数据库大小统计
+				{"sizeOnDisk", dbSize}, // 实现数据库大小统计
 				{"empty", len(db.Tables) == 0},
 			})
 		}
 
+		// 计算总大小（MB）
+		totalSizeMb := float64(totalSize) / (1024 * 1024)
+
 		return bson.D{
 			{"ok", 1},
 			{"databases", dbList},
-			{"totalSize", int64(0)},   // TODO: 实现总大小统计
-			{"totalSizeMb", int64(0)}, // TODO: 实现总大小统计(MB)
+			{"totalSize", totalSize},     // 实现总大小统计
+			{"totalSizeMb", totalSizeMb}, // 实现总大小统计(MB)
 		}, nil
 	})
 
@@ -575,48 +598,120 @@ func registerCommands(handler *protocol.CommandHandler, storageEngine *storage.S
 
 	// 列出集合命令
 	handler.Register("listCollections", func(ctx context.Context, cmd bson.D) (bson.D, error) {
+		// 解析命令参数
 		var dbName string
+		var filter bson.D
+		var nameOnly bool
 
 		for _, elem := range cmd {
 			switch elem.Key {
+			case "listCollections":
+				if val, ok := elem.Value.(float64); ok && val == 1 {
+					// 命令格式正确
+				}
 			case "$db":
 				if str, ok := elem.Value.(string); ok {
 					dbName = str
 				}
+			case "filter":
+				if f, ok := elem.Value.(bson.D); ok {
+					filter = f
+				}
+			case "nameOnly":
+				if b, ok := elem.Value.(bool); ok {
+					nameOnly = b
+				}
 			}
 		}
 
-		if dbName == "" {
-			return nil, fmt.Errorf("missing database name")
-		}
-
-		// 获取数据库中的所有表
-		tables, err := storageEngine.ListTables(dbName)
+		// 检查数据库是否存在
+		databases, err := storageEngine.ListDatabases()
 		if err != nil {
 			return nil, err
+		}
+
+		var dbExists bool
+		var tables []*model.Table
+		for _, db := range databases {
+			if db.Name == dbName {
+				dbExists = true
+				// 获取数据库中的表
+				tables, err = storageEngine.ListTables(dbName)
+				if err != nil {
+					return nil, err
+				}
+				break
+			}
+		}
+
+		if !dbExists {
+			return nil, fmt.Errorf("database %s does not exist", dbName)
 		}
 
 		// 构建集合列表
 		collections := make(bson.A, 0, len(tables))
 		for _, table := range tables {
-			collections = append(collections, bson.D{
+			// 应用过滤器
+			if filter != nil {
+				// 简单实现：只支持按名称过滤
+				match := true
+				for _, elem := range filter {
+					if elem.Key == "name" {
+						if namePattern, ok := elem.Value.(string); ok && namePattern != table.Name {
+							match = false
+							break
+						}
+					}
+				}
+				if !match {
+					continue
+				}
+			}
+
+			collectionInfo := bson.D{
 				{"name", table.Name},
 				{"type", "collection"},
-				{"options", bson.D{}},
-				{"info", bson.D{
-					{"readOnly", false},
-					{"uuid", primitive.Binary{Subtype: 0x04}}, // 随机UUID
-				}},
-			})
+			}
+
+			// 如果不是只返回名称，添加更多信息
+			if !nameOnly {
+				// 获取表大小
+				size, err := storageEngine.GetTableSize(dbName, table.Name)
+				if err != nil {
+					// 如果获取大小失败，记录错误但继续处理
+					log.Printf("获取表 %s.%s 大小失败: %v", dbName, table.Name, err)
+					size = 0
+				}
+
+				// 添加额外信息
+				collectionInfo = append(collectionInfo,
+					bson.E{"options", bson.D{}},
+					bson.E{"info", bson.D{
+						{"readOnly", false},
+						{"uuid", primitive.NewObjectID().Hex()},
+					}},
+					bson.E{"idIndex", bson.D{
+						{"v", 2},
+						{"key", bson.D{{"_id", 1}}},
+						{"name", "_id_"},
+					}},
+					bson.E{"size", size},
+				)
+			}
+
+			collections = append(collections, collectionInfo)
+		}
+
+		// 构建响应
+		cursor := bson.D{
+			{"id", int64(0)},
+			{"ns", dbName + ".$cmd.listCollections"},
+			{"firstBatch", collections},
 		}
 
 		return bson.D{
+			{"cursor", cursor},
 			{"ok", 1},
-			{"cursor", bson.D{
-				{"firstBatch", collections},
-				{"id", int64(0)},
-				{"ns", dbName + ".$cmd.listCollections"},
-			}},
 		}, nil
 	})
 
@@ -1053,6 +1148,126 @@ func registerCommands(handler *protocol.CommandHandler, storageEngine *storage.S
 				{"id", int64(0)},
 				{"ns", dbName + "." + tableName},
 			}},
+		}, nil
+	})
+
+	// 数据库统计命令
+	handler.Register("dbStats", func(ctx context.Context, cmd bson.D) (bson.D, error) {
+		// 解析命令参数
+		var dbName string
+		var scale float64 = 1 // 默认比例为1
+
+		for _, elem := range cmd {
+			switch elem.Key {
+			case "dbStats":
+				if str, ok := elem.Value.(string); ok {
+					dbName = str
+				}
+			case "$db":
+				if str, ok := elem.Value.(string); ok && dbName == "" {
+					dbName = str
+				}
+			case "scale":
+				if val, ok := elem.Value.(float64); ok {
+					scale = val
+				}
+			}
+		}
+
+		if dbName == "" {
+			return nil, fmt.Errorf("missing database name")
+		}
+
+		// 检查数据库是否存在
+		databases, err := storageEngine.ListDatabases()
+		if err != nil {
+			return nil, err
+		}
+
+		var dbExists bool
+		for _, d := range databases {
+			if d.Name == dbName {
+				dbExists = true
+				break
+			}
+		}
+
+		if !dbExists {
+			return nil, fmt.Errorf("database %s does not exist", dbName)
+		}
+
+		// 获取数据库中的表
+		tables, err := storageEngine.ListTables(dbName)
+		if err != nil {
+			return nil, err
+		}
+
+		// 计算统计信息
+		var avgObjSize float64
+		var dataSize int64
+		var storageSize int64
+		var numObjects int64
+		var indexes int
+		var indexSize int64
+		var fileSize int64
+
+		// 计算表统计信息
+		for _, table := range tables {
+			// 获取表大小
+			tableSize, err := storageEngine.GetTableSize(dbName, table.Name)
+			if err != nil {
+				// 如果获取大小失败，记录错误但继续处理
+				log.Printf("获取表 %s.%s 大小失败: %v", dbName, table.Name, err)
+				continue
+			}
+
+			storageSize += tableSize
+			fileSize += tableSize
+			dataSize += tableSize
+
+			// 获取表中的索引
+			tableIndexes, err := storageEngine.ListIndexes(dbName, table.Name)
+			if err != nil {
+				// 如果获取索引失败，记录错误但继续处理
+				log.Printf("获取表 %s.%s 索引失败: %v", dbName, table.Name, err)
+			} else {
+				indexes += len(tableIndexes)
+				// 假设每个索引大小为表大小的10%
+				indexSize += tableSize / 10
+			}
+
+			// 假设每个对象大小为100字节
+			tableObjects := tableSize / 100
+			numObjects += tableObjects
+		}
+
+		// 计算平均对象大小
+		if numObjects > 0 {
+			avgObjSize = float64(dataSize) / float64(numObjects)
+		}
+
+		// 应用比例
+		scaledAvgObjSize := avgObjSize / scale
+		scaledDataSize := float64(dataSize) / scale
+		scaledStorageSize := float64(storageSize) / scale
+		scaledIndexSize := float64(indexSize) / scale
+		scaledFileSize := float64(fileSize) / scale
+
+		// 构建响应
+		return bson.D{
+			{"db", dbName},
+			{"collections", len(tables)},
+			{"views", 0},
+			{"objects", numObjects},
+			{"avgObjSize", scaledAvgObjSize},
+			{"dataSize", scaledDataSize},
+			{"storageSize", scaledStorageSize},
+			{"numExtents", 0},
+			{"indexes", indexes},
+			{"indexSize", scaledIndexSize},
+			{"fsUsedSize", scaledFileSize},
+			{"fsTotalSize", scaledFileSize * 10}, // 假设总空间是已用空间的10倍
+			{"ok", 1},
 		}, nil
 	})
 }

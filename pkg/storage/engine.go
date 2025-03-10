@@ -1836,3 +1836,69 @@ func (e *StorageEngine) parseDataFile(data []byte, startTime, endTime int64) ([]
 
 	return result, nil
 }
+
+// GetDatabaseSize 获取数据库大小（字节）
+func (e *StorageEngine) GetDatabaseSize(dbName string) (int64, error) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	db, exists := e.databases[dbName]
+	if !exists {
+		return 0, fmt.Errorf("database %s not found", dbName)
+	}
+
+	var totalSize int64
+	for tableName := range db.Tables {
+		tableSize, err := e.GetTableSize(dbName, tableName)
+		if err != nil {
+			return 0, err
+		}
+		totalSize += tableSize
+	}
+
+	return totalSize, nil
+}
+
+// GetTableSize 获取表大小（字节）
+func (e *StorageEngine) GetTableSize(dbName, tableName string) (int64, error) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	db, exists := e.databases[dbName]
+	if !exists {
+		return 0, fmt.Errorf("database %s not found", dbName)
+	}
+
+	// 检查表是否存在
+	if _, exists := db.Tables[tableName]; !exists {
+		return 0, fmt.Errorf("table %s not found in database %s", tableName, dbName)
+	}
+
+	// 计算表数据文件大小
+	tableDataPath := filepath.Join(e.dataDir, dbName, tableName)
+	size, err := getDirSize(tableDataPath)
+	if err != nil {
+		// 如果目录不存在，可能是新表，返回0
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+
+	return size, nil
+}
+
+// getDirSize 获取目录大小（字节）
+func getDirSize(path string) (int64, error) {
+	var size int64
+	err := filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			size += info.Size()
+		}
+		return nil
+	})
+	return size, err
+}

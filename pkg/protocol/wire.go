@@ -6,10 +6,15 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
+
+	"ChronoGo/pkg/query"
 )
 
 // MongoDB操作码
@@ -54,6 +59,7 @@ type Session struct {
 	mu         sync.Mutex
 	cursorMap  map[int64]*Cursor
 	nextCursor int64
+	lastActive time.Time // 最后活动时间
 }
 
 // Cursor 表示查询游标
@@ -65,6 +71,8 @@ type Cursor struct {
 	Batch      []bson.D
 	Position   int
 	Exhausted  bool
+	CreatedAt  time.Time // 创建时间
+	LastUsed   time.Time // 最后使用时间
 }
 
 // WireProtocolHandler 表示MongoDB协议处理器
@@ -74,8 +82,51 @@ type WireProtocolHandler struct {
 	nextSession   int32
 	nextRequestID int32 // 添加请求ID计数器
 	cmdHandler    *CommandHandler
+	queryEngine   *query.QueryEngine
+	storageEngine interface{} // 使用interface{}以避免循环导入
 	mu            sync.RWMutex
 	closing       chan struct{}
+
+	// 游标管理
+	cursorTTL     time.Duration // 游标生存时间
+	cleanupTicker *time.Ticker  // 清理定时器
+
+	// 连接池管理
+	maxConnections int           // 最大连接数
+	idleTimeout    time.Duration // 空闲连接超时时间
+
+	// 批处理
+	batchSize     int           // 批处理大小
+	batchInterval time.Duration // 批处理间隔
+	batchQueue    chan *batchOperation
+	batchWorkers  int // 批处理工作线程数
+}
+
+// batchOperation 表示批处理操作
+type batchOperation struct {
+	opType     string           // 操作类型：insert, update, delete
+	database   string           // 数据库名
+	collection string           // 集合名
+	documents  []bson.D         // 文档
+	filter     bson.D           // 过滤条件
+	update     bson.D           // 更新内容
+	resultCh   chan batchResult // 结果通道
+}
+
+// batchResult 表示批处理结果
+type batchResult struct {
+	count int   // 影响的文档数
+	err   error // 错误
+}
+
+// SetQueryEngine 设置查询引擎
+func (h *WireProtocolHandler) SetQueryEngine(engine *query.QueryEngine) {
+	h.queryEngine = engine
+}
+
+// SetStorageEngine 设置存储引擎
+func (h *WireProtocolHandler) SetStorageEngine(engine interface{}) {
+	h.storageEngine = engine
 }
 
 // NewWireProtocolHandler 创建新的协议处理器
@@ -85,17 +136,38 @@ func NewWireProtocolHandler(addr string, cmdHandler *CommandHandler) (*WireProto
 		return nil, fmt.Errorf("failed to listen on %s: %w", addr, err)
 	}
 
-	return &WireProtocolHandler{
-		listener:   listener,
-		sessions:   make(map[int32]*Session),
-		cmdHandler: cmdHandler,
-		closing:    make(chan struct{}),
-	}, nil
+	h := &WireProtocolHandler{
+		listener:      listener,
+		sessions:      make(map[int32]*Session),
+		nextSession:   1,
+		nextRequestID: 1,
+		cmdHandler:    cmdHandler,
+		closing:       make(chan struct{}),
+
+		// 游标管理
+		cursorTTL:     time.Hour, // 默认游标生存时间为1小时
+		cleanupTicker: time.NewTicker(10 * time.Minute),
+
+		maxConnections: 1000,                   // 默认最大连接数
+		idleTimeout:    30 * time.Minute,       // 默认空闲连接超时时间
+		batchSize:      1000,                   // 默认批处理大小
+		batchInterval:  100 * time.Millisecond, // 默认批处理间隔
+		batchQueue:     make(chan *batchOperation, 10000),
+		batchWorkers:   4, // 默认4个批处理工作线程
+	}
+
+	return h, nil
 }
 
 // Start 启动协议处理器
 func (h *WireProtocolHandler) Start() {
 	go h.acceptLoop()
+	go h.cleanupLoop() // 启动游标清理循环
+
+	// 启动批处理工作线程
+	for i := 0; i < h.batchWorkers; i++ {
+		go h.batchWorker()
+	}
 }
 
 // acceptLoop 接受新连接
@@ -138,21 +210,41 @@ func (h *WireProtocolHandler) acceptLoop() {
 // handleSession 处理客户端会话
 func (h *WireProtocolHandler) handleSession(session *Session) {
 	defer func() {
+		// 关闭连接
 		session.Conn.Close()
+
+		// 移除会话
 		h.mu.Lock()
 		delete(h.sessions, session.ID)
 		h.mu.Unlock()
+
+		fmt.Printf("Client disconnected: %s (Session ID: %d)\n", session.Conn.RemoteAddr(), session.ID)
 	}()
 
+	fmt.Printf("New client connected: %s (Session ID: %d)\n", session.Conn.RemoteAddr(), session.ID)
+
+	buffer := make([]byte, 4096)
+
 	for {
+		// 检查是否正在关闭
+		select {
+		case <-h.closing:
+			return
+		default:
+		}
+
 		// 读取消息头
 		headerBytes := make([]byte, 16)
-		if _, err := io.ReadFull(session.Conn, headerBytes); err != nil {
+		_, err := io.ReadFull(session.Conn, headerBytes)
+		if err != nil {
 			if err != io.EOF {
-				// 记录错误
+				fmt.Printf("Failed to read message header: %v\n", err)
 			}
 			return
 		}
+
+		// 更新会话活动时间
+		session.updateActivity()
 
 		// 解析消息头
 		header := MsgHeader{
@@ -162,28 +254,40 @@ func (h *WireProtocolHandler) handleSession(session *Session) {
 			OpCode:        int32(binary.LittleEndian.Uint32(headerBytes[12:16])),
 		}
 
-		// 读取消息体
-		bodyLength := header.MessageLength - 16
-		if bodyLength <= 0 {
-			// 无效的消息长度
+		// 检查消息长度
+		if header.MessageLength < 16 {
+			fmt.Printf("Invalid message length: %d\n", header.MessageLength)
 			return
 		}
 
-		bodyBytes := make([]byte, bodyLength)
-		if _, err := io.ReadFull(session.Conn, bodyBytes); err != nil {
-			// 记录错误
-			return
+		// 读取消息体
+		bodyLength := header.MessageLength - 16
+		var body []byte
+
+		if bodyLength > 0 {
+			// 如果消息体太大，需要扩展缓冲区
+			if bodyLength > int32(len(buffer)) {
+				body = make([]byte, bodyLength)
+			} else {
+				body = buffer[:bodyLength]
+			}
+
+			_, err = io.ReadFull(session.Conn, body)
+			if err != nil {
+				fmt.Printf("Failed to read message body: %v\n", err)
+				return
+			}
 		}
 
 		// 处理消息
 		msg := &Message{
 			Header: header,
-			Body:   bodyBytes,
+			Body:   body,
 		}
 
-		// 处理消息并发送响应
-		if err := h.handleMessage(session, msg); err != nil {
-			// 记录错误
+		err = h.handleMessage(session, msg)
+		if err != nil {
+			fmt.Printf("Failed to handle message: %v\n", err)
 			return
 		}
 	}
@@ -215,11 +319,12 @@ func (h *WireProtocolHandler) handleMessage(session *Session, msg *Message) erro
 // handleOpQuery 处理查询操作
 func (h *WireProtocolHandler) handleOpQuery(session *Session, msg *Message) error {
 	// 解析查询消息
-	if len(msg.Body) < 4 {
+	if len(msg.Body) < 12 {
 		return fmt.Errorf("invalid query message")
 	}
 
-	// 跳过标志位(4字节)
+	// 读取标志位（暂时不使用）
+	_ = binary.LittleEndian.Uint32(msg.Body[0:4])
 	offset := 4
 
 	// 读取集合名称
@@ -229,129 +334,68 @@ func (h *WireProtocolHandler) handleOpQuery(session *Session, msg *Message) erro
 	}
 	offset += n
 
-	// 解析数据库和集合名称
-	parts := splitNamespace(collName)
-	if len(parts) != 2 {
-		return fmt.Errorf("invalid namespace: %s", collName)
-	}
-	dbName, colName := parts[0], parts[1]
+	// 读取跳过数量和返回数量（暂时不使用）
+	_ = binary.LittleEndian.Uint32(msg.Body[offset:]) // numberToSkip
+	offset += 4
+	_ = binary.LittleEndian.Uint32(msg.Body[offset:]) // numberToReturn
+	offset += 4
 
-	// 跳过numberToSkip(4字节)和numberToReturn(4字节)
-	offset += 8
-
-	// 解析查询文档
+	// 读取查询文档
 	var query bson.D
 	err = bson.Unmarshal(msg.Body[offset:], &query)
 	if err != nil {
 		return err
 	}
 
-	// 处理特殊命令集合
-	if colName == "$cmd" {
-		// 执行命令
+	// 解析命令
+	parts := splitNamespace(collName)
+	if len(parts) != 2 {
+		return fmt.Errorf("invalid namespace: %s", collName)
+	}
+
+	// 这里不使用dbName，但保留它以便将来扩展
+	collName = parts[1]
+
+	// 检查是否是命令
+	if collName == "$cmd" {
+		// 创建上下文，并添加会话信息和引擎信息
 		ctx := context.Background()
+		ctx = context.WithValue(ctx, "session", session)
+
+		// 添加查询引擎和存储引擎到上下文
+		if h.queryEngine != nil {
+			ctx = context.WithValue(ctx, "queryEngine", h.queryEngine)
+		}
+
+		if h.storageEngine != nil {
+			ctx = context.WithValue(ctx, "storageEngine", h.storageEngine)
+		}
+
+		// 执行命令
 		result, err := h.cmdHandler.Execute(ctx, query)
 		if err != nil {
-			// 发送错误响应
+			// 创建错误响应
 			errorDoc := bson.D{
 				{"ok", 0},
 				{"errmsg", err.Error()},
 				{"code", 1},
 			}
-			return h.sendReply(session, msg.Header.RequestID, []bson.D{errorDoc}, 0, 0)
+
+			// 发送错误响应
+			return h.sendReply(session, msg.Header.RequestID, []bson.D{errorDoc}, QueryFailure, 0)
 		}
 
-		// 发送命令结果
+		// 发送成功响应
 		return h.sendReply(session, msg.Header.RequestID, []bson.D{result}, 0, 0)
 	}
 
-	// 普通查询
-	// 创建查询上下文
-	ctx := context.Background()
+	// 处理普通查询
+	// TODO: 实现普通查询处理
+	// 在实际实现中，应该使用dbName和collName参数
+	_ = parts[0]
 
-	// 执行find命令
-	findCmd := bson.D{
-		{"find", colName},
-		{"filter", query},
-	}
-
-	result, err := h.cmdHandler.Execute(ctx, findCmd)
-	if err != nil {
-		// 发送错误响应
-		errorDoc := bson.D{
-			{"ok", 0},
-			{"errmsg", err.Error()},
-			{"code", 1},
-		}
-		return h.sendReply(session, msg.Header.RequestID, []bson.D{errorDoc}, 0, 0)
-	}
-
-	// 从结果中提取游标信息
-	cursorDoc, err := getBsonValue(result, "cursor")
-	if err != nil {
-		return err
-	}
-
-	cursorMap, ok := cursorDoc.(bson.D)
-	if !ok {
-		return fmt.Errorf("invalid cursor format")
-	}
-
-	// 提取第一批结果
-	firstBatch, err := getBsonValue(cursorMap, "firstBatch")
-	if err != nil {
-		return err
-	}
-
-	batchArray, ok := firstBatch.(bson.A)
-	if !ok {
-		return fmt.Errorf("invalid firstBatch format")
-	}
-
-	// 转换为bson.D数组
-	documents := make([]bson.D, 0, len(batchArray))
-	for _, item := range batchArray {
-		if doc, ok := item.(bson.D); ok {
-			documents = append(documents, doc)
-		}
-	}
-
-	// 提取游标ID
-	cursorIDValue, err := getBsonValue(cursorMap, "id")
-	if err != nil {
-		return err
-	}
-
-	var cursorID int64
-	switch v := cursorIDValue.(type) {
-	case int64:
-		cursorID = v
-	case int32:
-		cursorID = int64(v)
-	case float64:
-		cursorID = int64(v)
-	default:
-		cursorID = 0
-	}
-
-	// 如果有游标ID，保存游标信息
-	if cursorID != 0 {
-		cursor := &Cursor{
-			ID:         cursorID,
-			Query:      query,
-			Database:   dbName,
-			Collection: colName,
-			Batch:      documents,
-			Position:   0,
-			Exhausted:  false,
-		}
-		session.mu.Lock()
-		session.cursorMap[cursorID] = cursor
-		session.mu.Unlock()
-	}
-
-	// 发送查询结果
-	return h.sendReply(session, msg.Header.RequestID, documents, 0, cursorID)
+	// 暂时返回空结果
+	return h.sendReply(session, msg.Header.RequestID, []bson.D{}, 0, 0)
 }
 
 // handleOpGetMore 处理获取更多结果操作
@@ -361,129 +405,50 @@ func (h *WireProtocolHandler) handleOpGetMore(session *Session, msg *Message) er
 		return fmt.Errorf("invalid getMore message")
 	}
 
-	// 跳过numberToReturn(4字节)
-	offset := 4
+	// 更新会话活动时间
+	session.updateActivity()
 
 	// 读取集合名称
-	collName, n, err := readCString(msg.Body[offset:])
+	collName, n, err := readCString(msg.Body[0:])
 	if err != nil {
 		return err
 	}
-	offset += n
+	offset := n
 
-	// 解析数据库和集合名称
-	parts := splitNamespace(collName)
-	if len(parts) != 2 {
-		return fmt.Errorf("invalid namespace: %s", collName)
-	}
-	dbName, colName := parts[0], parts[1]
+	// 读取返回数量
+	numberToReturn := binary.LittleEndian.Uint32(msg.Body[offset:])
+	offset += 4
 
 	// 读取游标ID
 	cursorID := int64(binary.LittleEndian.Uint64(msg.Body[offset:]))
 
-	// 查找游标
-	session.mu.Lock()
-	cursor, ok := session.cursorMap[cursorID]
-	session.mu.Unlock()
-
-	if !ok {
-		// 游标不存在
-		return h.sendReply(session, msg.Header.RequestID, nil, CursorNotFound, 0)
+	// 解析命名空间
+	parts := splitNamespace(collName)
+	if len(parts) != 2 {
+		return fmt.Errorf("invalid namespace: %s", collName)
 	}
 
-	// 验证游标所属的数据库和集合
-	if cursor.Database != dbName || cursor.Collection != colName {
-		return fmt.Errorf("cursor belongs to different namespace")
+	// 这里不使用dbName，但保留它以便将来扩展
+	collName = parts[1]
+
+	// 获取游标
+	cursor := session.getCursor(cursorID)
+	if cursor == nil {
+		// 游标不存在，返回空结果
+		return h.sendReply(session, msg.Header.RequestID, []bson.D{}, CursorNotFound, 0)
 	}
 
-	// 如果游标已耗尽，返回空结果
+	// 获取下一批数据
+	batch := cursor.getNextBatch(int(numberToReturn))
+
+	// 如果游标已耗尽，则移除
 	if cursor.Exhausted {
-		return h.sendReply(session, msg.Header.RequestID, nil, Exhausted, 0)
+		session.removeCursor(cursorID)
+		cursorID = 0
 	}
 
-	// 创建查询上下文
-	ctx := context.Background()
-
-	// 执行getMore命令
-	getMoreCmd := bson.D{
-		{"getMore", cursorID},
-		{"collection", colName},
-	}
-
-	result, err := h.cmdHandler.Execute(ctx, getMoreCmd)
-	if err != nil {
-		// 发送错误响应
-		errorDoc := bson.D{
-			{"ok", 0},
-			{"errmsg", err.Error()},
-			{"code", 1},
-		}
-		return h.sendReply(session, msg.Header.RequestID, []bson.D{errorDoc}, 0, 0)
-	}
-
-	// 从结果中提取游标信息
-	cursorDoc, err := getBsonValue(result, "cursor")
-	if err != nil {
-		return err
-	}
-
-	cursorMap, ok := cursorDoc.(bson.D)
-	if !ok {
-		return fmt.Errorf("invalid cursor format")
-	}
-
-	// 提取下一批结果
-	nextBatch, err := getBsonValue(cursorMap, "nextBatch")
-	if err != nil {
-		return err
-	}
-
-	batchArray, ok := nextBatch.(bson.A)
-	if !ok {
-		return fmt.Errorf("invalid nextBatch format")
-	}
-
-	// 转换为bson.D数组
-	documents := make([]bson.D, 0, len(batchArray))
-	for _, item := range batchArray {
-		if doc, ok := item.(bson.D); ok {
-			documents = append(documents, doc)
-		}
-	}
-
-	// 提取游标ID
-	newCursorIDValue, err := getBsonValue(cursorMap, "id")
-	if err != nil {
-		return err
-	}
-
-	var newCursorID int64
-	switch v := newCursorIDValue.(type) {
-	case int64:
-		newCursorID = v
-	case int32:
-		newCursorID = int64(v)
-	case float64:
-		newCursorID = int64(v)
-	default:
-		newCursorID = 0
-	}
-
-	// 更新游标状态
-	if newCursorID == 0 {
-		// 游标已耗尽
-		cursor.Exhausted = true
-		session.mu.Lock()
-		delete(session.cursorMap, cursorID)
-		session.mu.Unlock()
-	} else {
-		// 更新游标批次
-		cursor.Batch = documents
-		cursor.Position = 0
-	}
-
-	// 发送查询结果
-	return h.sendReply(session, msg.Header.RequestID, documents, 0, newCursorID)
+	// 发送响应
+	return h.sendReply(session, msg.Header.RequestID, batch, 0, cursorID)
 }
 
 // handleOpKillCursors 处理关闭游标操作
@@ -779,15 +744,29 @@ func (h *WireProtocolHandler) handleOpMsg(session *Session, msg *Message) error 
 	var doc bson.D
 	err := bson.Unmarshal(msg.Body[offset:], &doc)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to unmarshal command document: %w", err)
 	}
 
-	// 创建查询上下文
+	// 创建查询上下文，并添加会话信息和引擎信息
 	ctx := context.Background()
+	ctx = context.WithValue(ctx, "session", session)
+
+	// 添加查询引擎和存储引擎到上下文
+	if h.queryEngine != nil {
+		ctx = context.WithValue(ctx, "queryEngine", h.queryEngine)
+	}
+
+	if h.storageEngine != nil {
+		ctx = context.WithValue(ctx, "storageEngine", h.storageEngine)
+	}
+
+	// 添加请求ID到日志
+	fmt.Printf("Received command: %v (RequestID: %d)\n", getCommandName(doc), msg.Header.RequestID)
 
 	// 执行命令
 	result, err := h.cmdHandler.Execute(ctx, doc)
 	if err != nil {
+		fmt.Printf("Command execution error: %v\n", err)
 		// 创建错误响应
 		errorDoc := bson.D{
 			{"ok", 0},
@@ -799,8 +778,16 @@ func (h *WireProtocolHandler) handleOpMsg(session *Session, msg *Message) error 
 		return h.sendOpMsg(session, msg.Header.RequestID, errorDoc)
 	}
 
-	// 发送命令结果
+	// 发送成功响应
 	return h.sendOpMsg(session, msg.Header.RequestID, result)
+}
+
+// getCommandName 获取命令名称
+func getCommandName(doc bson.D) string {
+	if len(doc) > 0 {
+		return doc[0].Key
+	}
+	return "unknown"
 }
 
 // sendOpMsg 发送OpMsg响应
@@ -926,12 +913,22 @@ func (h *WireProtocolHandler) sendReply(session *Session, responseTo int32, docu
 // Close 关闭协议处理器
 func (h *WireProtocolHandler) Close() error {
 	close(h.closing)
+
+	// 关闭所有会话
+	h.mu.Lock()
+	for _, session := range h.sessions {
+		session.Conn.Close()
+	}
+	h.sessions = make(map[int32]*Session)
+	h.mu.Unlock()
+
+	// 关闭监听器
 	return h.listener.Close()
 }
 
 // CommandHandler 表示命令处理器
 type CommandHandler struct {
-	registry map[string]CommandFunc
+	commands map[string]CommandFunc
 	mu       sync.RWMutex
 }
 
@@ -941,7 +938,7 @@ type CommandFunc func(ctx context.Context, cmd bson.D) (bson.D, error)
 // NewCommandHandler 创建新的命令处理器
 func NewCommandHandler() *CommandHandler {
 	return &CommandHandler{
-		registry: make(map[string]CommandFunc),
+		commands: make(map[string]CommandFunc),
 	}
 }
 
@@ -949,7 +946,7 @@ func NewCommandHandler() *CommandHandler {
 func (h *CommandHandler) Register(name string, fn CommandFunc) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.registry[name] = fn
+	h.commands[name] = fn
 }
 
 // Execute 执行命令
@@ -958,27 +955,1176 @@ func (h *CommandHandler) Execute(ctx context.Context, cmd bson.D) (bson.D, error
 		return nil, fmt.Errorf("empty command")
 	}
 
-	cmdName := cmd[0].Key
+	// 获取命令名称
+	cmdName := strings.ToLower(cmd[0].Key)
 
-	h.mu.RLock()
-	fn, exists := h.registry[cmdName]
-	h.mu.RUnlock()
-
-	if !exists {
-		return nil, fmt.Errorf("unknown command: %s", cmdName)
+	// 处理命令别名
+	switch cmdName {
+	case "ismaster":
+		cmdName = "isMaster" // 标准化为驼峰命名
+	case "listdatabases":
+		cmdName = "listDatabases"
+	case "listcollections":
+		cmdName = "listCollections"
+	case "dropdatabase":
+		cmdName = "dropDatabase"
+	case "buildinfo":
+		cmdName = "buildInfo"
+	case "serverstatus":
+		cmdName = "serverStatus"
+	case "getparameter":
+		cmdName = "getParameter"
+	case "getlog":
+		cmdName = "getLog"
+	case "getmore":
+		cmdName = "getMore"
+	case "killcursors":
+		cmdName = "killCursors"
+	case "timewindow":
+		cmdName = "timeWindow"
+	case "movingwindow":
+		cmdName = "movingWindow"
+	case "dbstats":
+		cmdName = "dbStats"
 	}
 
+	// 查找命令处理函数
+	h.mu.RLock()
+	fn, ok := h.commands[cmdName]
+	h.mu.RUnlock()
+
+	if !ok {
+		// 尝试查找小写版本
+		h.mu.RLock()
+		fn, ok = h.commands[strings.ToLower(cmdName)]
+		h.mu.RUnlock()
+
+		if !ok {
+			return nil, fmt.Errorf("unknown command: %s", cmdName)
+		}
+	}
+
+	// 执行命令
 	return fn(ctx, cmd)
 }
 
 // RegisterStandardCommands 注册标准MongoDB命令
 func (h *CommandHandler) RegisterStandardCommands() {
-	// TODO: 实现标准命令注册
+	// 服务器信息命令
+	h.Register("isMaster", func(ctx context.Context, cmd bson.D) (bson.D, error) {
+		return bson.D{
+			{"ismaster", true},
+			{"maxBsonObjectSize", 16777216},
+			{"maxMessageSizeBytes", 48000000},
+			{"maxWriteBatchSize", 100000},
+			{"localTime", time.Now()},
+			{"maxWireVersion", 13},
+			{"minWireVersion", 0},
+			{"readOnly", false},
+			{"ok", 1},
+		}, nil
+	})
+
+	// hello命令（MongoDB 5.0+中isMaster的替代命令）
+	h.Register("hello", func(ctx context.Context, cmd bson.D) (bson.D, error) {
+		return bson.D{
+			{"ismaster", true},
+			{"maxBsonObjectSize", 16777216},
+			{"maxMessageSizeBytes", 48000000},
+			{"maxWriteBatchSize", 100000},
+			{"localTime", time.Now()},
+			{"maxWireVersion", 13},
+			{"minWireVersion", 0},
+			{"readOnly", false},
+			{"ok", 1},
+		}, nil
+	})
+
+	// ping命令
+	h.Register("ping", func(ctx context.Context, cmd bson.D) (bson.D, error) {
+		return bson.D{{"ok", 1}}, nil
+	})
+
+	// buildInfo命令
+	h.Register("buildInfo", func(ctx context.Context, cmd bson.D) (bson.D, error) {
+		return bson.D{
+			{"version", "1.0.0"},
+			{"gitVersion", "ChronoGo-1.0.0"},
+			{"modules", bson.A{}},
+			{"sysInfo", "Go version go1.20 linux/amd64"},
+			{"versionArray", bson.A{1, 0, 0, 0}},
+			{"bits", 64},
+			{"debug", false},
+			{"maxBsonObjectSize", 16777216},
+			{"ok", 1},
+		}, nil
+	})
+
+	// 服务器状态命令
+	h.Register("serverStatus", func(ctx context.Context, cmd bson.D) (bson.D, error) {
+		return bson.D{
+			{"host", "localhost"},
+			{"version", "1.0.0"},
+			{"process", "ChronoGo"},
+			{"pid", os.Getpid()},
+			{"uptime", getUptime()}, // 使用实际的运行时间
+			{"localTime", time.Now().UnixMilli()},
+			{"ok", 1},
+		}, nil
+	})
+
+	// 获取参数命令
+	h.Register("getParameter", func(ctx context.Context, cmd bson.D) (bson.D, error) {
+		result := bson.D{{"ok", 1}}
+
+		for _, elem := range cmd {
+			if elem.Key == "getParameter" || elem.Key == "allParameters" {
+				// 添加所有支持的参数
+				result = append(result, bson.E{"featureCompatibilityVersion", "5.0"})
+				result = append(result, bson.E{"authSchemaVersion", 5})
+			} else if elem.Key != "$db" {
+				// 添加请求的特定参数
+				switch elem.Key {
+				case "featureCompatibilityVersion":
+					result = append(result, bson.E{"featureCompatibilityVersion", "5.0"})
+				case "authSchemaVersion":
+					result = append(result, bson.E{"authSchemaVersion", 5})
+				}
+			}
+		}
+
+		return result, nil
+	})
+
+	// 获取日志消息命令
+	h.Register("getLog", func(ctx context.Context, cmd bson.D) (bson.D, error) {
+		var logType string
+
+		for _, elem := range cmd {
+			if elem.Key == "getLog" {
+				if str, ok := elem.Value.(string); ok {
+					logType = str
+				}
+			}
+		}
+
+		if logType == "" {
+			return nil, fmt.Errorf("getLog requires a log name")
+		}
+
+		// 返回空日志
+		return bson.D{
+			{"log", bson.A{}},
+			{"totalLinesWritten", 0},
+			{"ok", 1},
+		}, nil
+	})
+
+	// 列出数据库命令
+	h.Register("listDatabases", func(ctx context.Context, cmd bson.D) (bson.D, error) {
+		return bson.D{
+			{"databases", bson.A{}},
+			{"totalSize", int64(0)},
+			{"totalSizeMb", int64(0)},
+			{"ok", 1},
+		}, nil
+	})
+
+	// 列出集合命令
+	h.Register("listCollections", func(ctx context.Context, cmd bson.D) (bson.D, error) {
+		return bson.D{
+			{"cursor", bson.D{
+				{"id", int64(0)},
+				{"ns", ""},
+				{"firstBatch", bson.A{}},
+			}},
+			{"ok", 1},
+		}, nil
+	})
+
+	// 创建集合命令
+	h.Register("create", func(ctx context.Context, cmd bson.D) (bson.D, error) {
+		return bson.D{{"ok", 1}}, nil
+	})
+
+	// 删除集合命令
+	h.Register("drop", func(ctx context.Context, cmd bson.D) (bson.D, error) {
+		return bson.D{{"ok", 1}}, nil
+	})
+
+	// 删除数据库命令
+	h.Register("dropDatabase", func(ctx context.Context, cmd bson.D) (bson.D, error) {
+		return bson.D{{"ok", 1}}, nil
+	})
+
+	// 查找命令
+	h.Register("find", func(ctx context.Context, cmd bson.D) (bson.D, error) {
+		var dbName, collName string
+		var filter bson.D
+		var limit int64 = 0
+		var skip int64 = 0
+		var batchSize int32 = 101 // 默认批次大小
+
+		// 解析命令参数
+		for _, elem := range cmd {
+			switch elem.Key {
+			case "find":
+				if str, ok := elem.Value.(string); ok {
+					collName = str
+				}
+			case "$db":
+				if str, ok := elem.Value.(string); ok {
+					dbName = str
+				}
+			case "filter":
+				if doc, ok := elem.Value.(bson.D); ok {
+					filter = doc
+				}
+			case "limit":
+				if val, ok := elem.Value.(int32); ok {
+					limit = int64(val)
+				} else if val, ok := elem.Value.(int64); ok {
+					limit = val
+				}
+			case "skip":
+				if val, ok := elem.Value.(int32); ok {
+					skip = int64(val)
+				} else if val, ok := elem.Value.(int64); ok {
+					skip = val
+				}
+			case "batchSize":
+				if val, ok := elem.Value.(int32); ok {
+					batchSize = val
+				} else if val, ok := elem.Value.(int64); ok {
+					batchSize = int32(val)
+				}
+			}
+		}
+
+		if dbName == "" || collName == "" {
+			return nil, fmt.Errorf("missing database or collection name")
+		}
+
+		// 获取会话
+		session, ok := ctx.Value("session").(*Session)
+		if !ok {
+			return nil, fmt.Errorf("session not found in context")
+		}
+
+		// 获取查询引擎和存储引擎
+		queryEngine, ok := ctx.Value("queryEngine").(*query.QueryEngine)
+		if !ok {
+			return nil, fmt.Errorf("query engine not found in context")
+		}
+
+		// 创建查询解析器
+		parser := query.NewQueryParser()
+
+		// 解析查询
+		q, err := parser.ParseQuery(dbName, collName, filter)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse query: %w", err)
+		}
+
+		// 设置分页参数
+		q.Limit = int(limit)
+		q.Offset = int(skip)
+
+		// 使用batchSize限制返回的结果数量
+		if batchSize > 0 && (limit == 0 || int64(batchSize) < limit) {
+			q.Limit = int(batchSize)
+		}
+
+		// 执行查询
+		result, err := queryEngine.Execute(ctx, q)
+		if err != nil {
+			return nil, fmt.Errorf("failed to execute query: %w", err)
+		}
+
+		// 转换结果为BSON文档
+		batch := make([]bson.D, 0, len(result.Points))
+		for _, point := range result.Points {
+			batch = append(batch, point.ToBSON())
+		}
+
+		// 创建游标
+		cursor := session.createCursor(dbName, collName, filter, batch)
+
+		// 创建响应
+		namespace := dbName + "." + collName
+		return createCursorResponse(namespace, cursor.ID, batch), nil
+	})
+
+	// 获取更多结果命令
+	h.Register("getMore", func(ctx context.Context, cmd bson.D) (bson.D, error) {
+		var cursorID int64
+		var dbName, collName string
+		var batchSize int32 = 101 // 默认批次大小
+
+		// 解析命令参数
+		for _, elem := range cmd {
+			switch elem.Key {
+			case "getMore":
+				if val, ok := elem.Value.(int64); ok {
+					cursorID = val
+				}
+			case "collection":
+				if str, ok := elem.Value.(string); ok {
+					collName = str
+				}
+			case "$db":
+				if str, ok := elem.Value.(string); ok {
+					dbName = str
+				}
+			case "batchSize":
+				if val, ok := elem.Value.(int32); ok {
+					batchSize = val
+				} else if val, ok := elem.Value.(int64); ok {
+					batchSize = int32(val)
+				}
+			}
+		}
+
+		if dbName == "" || collName == "" || cursorID == 0 {
+			return nil, fmt.Errorf("missing required parameters")
+		}
+
+		// 获取会话
+		session, ok := ctx.Value("session").(*Session)
+		if !ok {
+			return nil, fmt.Errorf("session not found in context")
+		}
+
+		// 获取游标
+		cursor := session.getCursor(cursorID)
+		if cursor == nil {
+			return nil, fmt.Errorf("cursor not found: %d", cursorID)
+		}
+
+		// 获取下一批数据
+		batch := cursor.getNextBatch(int(batchSize))
+
+		// 如果游标已耗尽，则移除
+		if cursor.Exhausted {
+			session.removeCursor(cursorID)
+			cursorID = 0
+		}
+
+		// 创建响应
+		namespace := dbName + "." + collName
+		return createGetMoreResponse(namespace, cursorID, batch), nil
+	})
+
+	// 关闭游标命令
+	h.Register("killCursors", func(ctx context.Context, cmd bson.D) (bson.D, error) {
+		var cursorIDs []int64
+		var dbName, collName string
+
+		// 解析命令参数
+		for _, elem := range cmd {
+			switch elem.Key {
+			case "killCursors":
+				if str, ok := elem.Value.(string); ok {
+					collName = str
+				}
+			case "$db":
+				if str, ok := elem.Value.(string); ok {
+					dbName = str
+				}
+			case "cursors":
+				if arr, ok := elem.Value.(bson.A); ok {
+					for _, val := range arr {
+						if id, ok := val.(int64); ok {
+							cursorIDs = append(cursorIDs, id)
+						}
+					}
+				}
+			}
+		}
+
+		if dbName == "" || collName == "" {
+			return nil, fmt.Errorf("missing database or collection name")
+		}
+
+		// 获取会话
+		session, ok := ctx.Value("session").(*Session)
+		if !ok {
+			return nil, fmt.Errorf("session not found in context")
+		}
+
+		// 关闭游标
+		killedCursors := bson.A{}
+		for _, id := range cursorIDs {
+			cursor := session.getCursor(id)
+			if cursor != nil {
+				session.removeCursor(id)
+				killedCursors = append(killedCursors, id)
+			}
+		}
+
+		// 创建响应
+		return bson.D{
+			{"cursorsKilled", killedCursors},
+			{"cursorsNotFound", bson.A{}},
+			{"cursorsAlive", bson.A{}},
+			{"cursorsUnknown", bson.A{}},
+			{"ok", 1},
+		}, nil
+	})
+
+	// 插入命令
+	h.Register("insert", func(ctx context.Context, cmd bson.D) (bson.D, error) {
+		var dbName, collName string
+		var documents bson.A
+
+		// 解析命令参数
+		for _, elem := range cmd {
+			switch elem.Key {
+			case "insert":
+				if str, ok := elem.Value.(string); ok {
+					collName = str
+				}
+			case "$db":
+				if str, ok := elem.Value.(string); ok {
+					dbName = str
+				}
+			case "documents":
+				if docs, ok := elem.Value.(bson.A); ok {
+					documents = docs
+				}
+			}
+		}
+
+		if dbName == "" || collName == "" || len(documents) == 0 {
+			return nil, fmt.Errorf("missing required parameters")
+		}
+
+		// 获取协议处理器
+		wireHandler, ok := ctx.Value("wireHandler").(*WireProtocolHandler)
+		if !ok {
+			// 如果上下文中没有协议处理器，使用传统方式处理
+			return bson.D{
+				{"n", len(documents)},
+				{"ok", 1},
+			}, nil
+		}
+
+		// 转换文档格式
+		docs := make([]bson.D, 0, len(documents))
+		for _, doc := range documents {
+			if bsonDoc, ok := doc.(bson.D); ok {
+				docs = append(docs, bsonDoc)
+			}
+		}
+
+		// 创建批处理操作
+		op := &batchOperation{
+			opType:     "insert",
+			database:   dbName,
+			collection: collName,
+			documents:  docs,
+		}
+
+		// 添加到批处理队列
+		result := wireHandler.queueBatchOperation(op)
+		if result.err != nil {
+			return nil, result.err
+		}
+
+		return bson.D{
+			{"n", result.count},
+			{"ok", 1},
+		}, nil
+	})
+
+	// 更新命令
+	h.Register("update", func(ctx context.Context, cmd bson.D) (bson.D, error) {
+		var dbName, collName string
+		var updates bson.A
+
+		// 解析命令参数
+		for _, elem := range cmd {
+			switch elem.Key {
+			case "update":
+				if str, ok := elem.Value.(string); ok {
+					collName = str
+				}
+			case "$db":
+				if str, ok := elem.Value.(string); ok {
+					dbName = str
+				}
+			case "updates":
+				if upds, ok := elem.Value.(bson.A); ok {
+					updates = upds
+				}
+			}
+		}
+
+		if dbName == "" || collName == "" || len(updates) == 0 {
+			return nil, fmt.Errorf("missing required parameters")
+		}
+
+		// 获取协议处理器
+		wireHandler, ok := ctx.Value("wireHandler").(*WireProtocolHandler)
+		if !ok {
+			// 如果上下文中没有协议处理器，使用传统方式处理
+			return bson.D{
+				{"n", len(updates)},
+				{"nModified", 0},
+				{"ok", 1},
+			}, nil
+		}
+
+		// 处理每个更新操作
+		nModified := 0
+		for _, update := range updates {
+			if updateDoc, ok := update.(bson.D); ok {
+				// 提取查询条件和更新内容
+				var filter, updateOp bson.D
+
+				for _, elem := range updateDoc {
+					switch elem.Key {
+					case "q": // 查询条件
+						if q, ok := elem.Value.(bson.D); ok {
+							filter = q
+						}
+					case "u": // 更新操作
+						if u, ok := elem.Value.(bson.D); ok {
+							updateOp = u
+						}
+					}
+				}
+
+				// 创建批处理操作
+				op := &batchOperation{
+					opType:     "update",
+					database:   dbName,
+					collection: collName,
+					filter:     filter,
+					update:     updateOp,
+				}
+
+				// 添加到批处理队列
+				result := wireHandler.queueBatchOperation(op)
+				if result.err != nil {
+					return nil, result.err
+				}
+
+				nModified += result.count
+			}
+		}
+
+		return bson.D{
+			{"n", len(updates)},
+			{"nModified", nModified},
+			{"ok", 1},
+		}, nil
+	})
+
+	// 删除命令
+	h.Register("delete", func(ctx context.Context, cmd bson.D) (bson.D, error) {
+		var dbName, collName string
+		var deletes bson.A
+
+		// 解析命令参数
+		for _, elem := range cmd {
+			switch elem.Key {
+			case "delete":
+				if str, ok := elem.Value.(string); ok {
+					collName = str
+				}
+			case "$db":
+				if str, ok := elem.Value.(string); ok {
+					dbName = str
+				}
+			case "deletes":
+				if dels, ok := elem.Value.(bson.A); ok {
+					deletes = dels
+				}
+			}
+		}
+
+		if dbName == "" || collName == "" || len(deletes) == 0 {
+			return nil, fmt.Errorf("missing required parameters")
+		}
+
+		// 获取协议处理器
+		wireHandler, ok := ctx.Value("wireHandler").(*WireProtocolHandler)
+		if !ok {
+			// 如果上下文中没有协议处理器，使用传统方式处理
+			return bson.D{
+				{"n", len(deletes)},
+				{"ok", 1},
+			}, nil
+		}
+
+		// 处理每个删除操作
+		nDeleted := 0
+		for _, delete := range deletes {
+			if deleteDoc, ok := delete.(bson.D); ok {
+				// 提取查询条件
+				var filter bson.D
+
+				for _, elem := range deleteDoc {
+					if elem.Key == "q" { // 查询条件
+						if q, ok := elem.Value.(bson.D); ok {
+							filter = q
+						}
+					}
+				}
+
+				// 创建批处理操作
+				op := &batchOperation{
+					opType:     "delete",
+					database:   dbName,
+					collection: collName,
+					filter:     filter,
+				}
+
+				// 添加到批处理队列
+				result := wireHandler.queueBatchOperation(op)
+				if result.err != nil {
+					return nil, result.err
+				}
+
+				nDeleted += result.count
+			}
+		}
+
+		return bson.D{
+			{"n", nDeleted},
+			{"ok", 1},
+		}, nil
+	})
 }
 
 // RegisterTimeSeriesCommands 注册时序特有命令
 func (h *CommandHandler) RegisterTimeSeriesCommands() {
-	// TODO: 实现时序特有命令注册
+	// 时间窗口聚合命令
+	h.Register("timeWindow", func(ctx context.Context, cmd bson.D) (bson.D, error) {
+		var dbName, collName string
+		var timeField string
+		var windowSize string
+		var aggregations bson.D
+		var filter bson.D
+		var startTime, endTime time.Time
+
+		// 解析命令参数
+		for _, elem := range cmd {
+			switch elem.Key {
+			case "timeWindow":
+				if str, ok := elem.Value.(string); ok {
+					collName = str
+				}
+			case "$db":
+				if str, ok := elem.Value.(string); ok {
+					dbName = str
+				}
+			case "timeField":
+				if str, ok := elem.Value.(string); ok {
+					timeField = str
+				}
+			case "windowSize":
+				if str, ok := elem.Value.(string); ok {
+					windowSize = str
+				}
+			case "aggregations":
+				if agg, ok := elem.Value.(bson.D); ok {
+					aggregations = agg
+				}
+			case "filter":
+				if f, ok := elem.Value.(bson.D); ok {
+					filter = f
+				}
+			case "startTime":
+				if t, ok := elem.Value.(time.Time); ok {
+					startTime = t
+				} else if str, ok := elem.Value.(string); ok {
+					// 尝试解析时间字符串
+					t, err := time.Parse(time.RFC3339, str)
+					if err == nil {
+						startTime = t
+					}
+				}
+			case "endTime":
+				if t, ok := elem.Value.(time.Time); ok {
+					endTime = t
+				} else if str, ok := elem.Value.(string); ok {
+					// 尝试解析时间字符串
+					t, err := time.Parse(time.RFC3339, str)
+					if err == nil {
+						endTime = t
+					}
+				}
+			}
+		}
+
+		if dbName == "" || collName == "" || timeField == "" || windowSize == "" || len(aggregations) == 0 {
+			return nil, fmt.Errorf("missing required parameters")
+		}
+
+		// 如果未指定结束时间，使用当前时间
+		if endTime.IsZero() {
+			endTime = time.Now()
+		}
+
+		// 如果未指定开始时间，使用结束时间减去一天
+		if startTime.IsZero() {
+			startTime = endTime.Add(-24 * time.Hour)
+		}
+
+		// 获取查询引擎
+		queryEngine, ok := ctx.Value("queryEngine").(*query.QueryEngine)
+		if !ok {
+			return nil, fmt.Errorf("query engine not found in context")
+		}
+
+		// 创建时间窗口聚合请求
+		request := map[string]interface{}{
+			"database":     dbName,
+			"collection":   collName,
+			"timeField":    timeField,
+			"windowSize":   windowSize,
+			"aggregations": aggregations,
+			"filter":       filter,
+			"startTime":    startTime.UnixNano(),
+			"endTime":      endTime.UnixNano(),
+		}
+
+		// 执行时间窗口聚合
+		result, err := queryEngine.ExecuteTimeWindowAggregation(ctx, request)
+		if err != nil {
+			return nil, fmt.Errorf("failed to execute time window aggregation: %w", err)
+		}
+
+		// 获取会话
+		session, ok := ctx.Value("session").(*Session)
+		if !ok {
+			return nil, fmt.Errorf("session not found in context")
+		}
+
+		// 转换结果为BSON文档
+		batch := make([]bson.D, 0, len(result))
+		for _, item := range result {
+			if doc, ok := item.(bson.D); ok {
+				batch = append(batch, doc)
+			} else if m, ok := item.(map[string]interface{}); ok {
+				// 转换map为bson.D
+				doc := bson.D{}
+				for k, v := range m {
+					doc = append(doc, bson.E{Key: k, Value: v})
+				}
+				batch = append(batch, doc)
+			}
+		}
+
+		// 创建游标
+		cursor := session.createCursor(dbName, collName, nil, batch)
+
+		// 创建响应
+		namespace := dbName + "." + collName
+		return createCursorResponse(namespace, cursor.ID, batch), nil
+	})
+
+	// 降采样命令
+	h.Register("downsample", func(ctx context.Context, cmd bson.D) (bson.D, error) {
+		var dbName, collName, targetColl string
+		var timeField string
+		var interval string
+		var aggregations bson.D
+		var filter bson.D
+		var startTime, endTime time.Time
+		var retention int64
+
+		// 解析命令参数
+		for _, elem := range cmd {
+			switch elem.Key {
+			case "downsample":
+				if str, ok := elem.Value.(string); ok {
+					collName = str
+				}
+			case "$db":
+				if str, ok := elem.Value.(string); ok {
+					dbName = str
+				}
+			case "targetCollection":
+				if str, ok := elem.Value.(string); ok {
+					targetColl = str
+				}
+			case "timeField":
+				if str, ok := elem.Value.(string); ok {
+					timeField = str
+				}
+			case "interval":
+				if str, ok := elem.Value.(string); ok {
+					interval = str
+				}
+			case "aggregations":
+				if agg, ok := elem.Value.(bson.D); ok {
+					aggregations = agg
+				}
+			case "filter":
+				if f, ok := elem.Value.(bson.D); ok {
+					filter = f
+				}
+			case "startTime":
+				if t, ok := elem.Value.(time.Time); ok {
+					startTime = t
+				} else if str, ok := elem.Value.(string); ok {
+					// 尝试解析时间字符串
+					t, err := time.Parse(time.RFC3339, str)
+					if err == nil {
+						startTime = t
+					}
+				}
+			case "endTime":
+				if t, ok := elem.Value.(time.Time); ok {
+					endTime = t
+				} else if str, ok := elem.Value.(string); ok {
+					// 尝试解析时间字符串
+					t, err := time.Parse(time.RFC3339, str)
+					if err == nil {
+						endTime = t
+					}
+				}
+			case "retention":
+				if val, ok := elem.Value.(int64); ok {
+					retention = val
+				} else if val, ok := elem.Value.(int32); ok {
+					retention = int64(val)
+				}
+			}
+		}
+
+		if dbName == "" || collName == "" || timeField == "" || interval == "" || len(aggregations) == 0 {
+			return nil, fmt.Errorf("missing required parameters")
+		}
+
+		// 如果未指定目标集合，使用源集合名加上降采样间隔
+		if targetColl == "" {
+			targetColl = collName + "_" + interval
+		}
+
+		// 如果未指定结束时间，使用当前时间
+		if endTime.IsZero() {
+			endTime = time.Now()
+		}
+
+		// 如果未指定开始时间，使用结束时间减去30天
+		if startTime.IsZero() {
+			startTime = endTime.Add(-30 * 24 * time.Hour)
+		}
+
+		// 获取查询引擎
+		queryEngine, ok := ctx.Value("queryEngine").(*query.QueryEngine)
+		if !ok {
+			return nil, fmt.Errorf("query engine not found in context")
+		}
+
+		// 创建降采样请求
+		request := map[string]interface{}{
+			"database":         dbName,
+			"sourceCollection": collName,
+			"targetCollection": targetColl,
+			"timeField":        timeField,
+			"interval":         interval,
+			"aggregations":     aggregations,
+			"filter":           filter,
+			"startTime":        startTime.UnixNano(),
+			"endTime":          endTime.UnixNano(),
+			"retention":        retention,
+		}
+
+		// 执行降采样
+		count, err := queryEngine.ExecuteDownsample(ctx, request)
+		if err != nil {
+			return nil, fmt.Errorf("failed to execute downsample: %w", err)
+		}
+
+		return bson.D{
+			{"ok", 1},
+			{"sourceCollection", collName},
+			{"targetCollection", targetColl},
+			{"count", count},
+			{"startTime", startTime},
+			{"endTime", endTime},
+			{"interval", interval},
+		}, nil
+	})
+
+	// 插值命令
+	h.Register("interpolate", func(ctx context.Context, cmd bson.D) (bson.D, error) {
+		var dbName, collName string
+		var timeField, valueField string
+		var method string
+		var interval string
+		var filter bson.D
+		var startTime, endTime time.Time
+
+		// 解析命令参数
+		for _, elem := range cmd {
+			switch elem.Key {
+			case "interpolate":
+				if str, ok := elem.Value.(string); ok {
+					collName = str
+				}
+			case "$db":
+				if str, ok := elem.Value.(string); ok {
+					dbName = str
+				}
+			case "timeField":
+				if str, ok := elem.Value.(string); ok {
+					timeField = str
+				}
+			case "valueField":
+				if str, ok := elem.Value.(string); ok {
+					valueField = str
+				}
+			case "method":
+				if str, ok := elem.Value.(string); ok {
+					method = str
+				}
+			case "interval":
+				if str, ok := elem.Value.(string); ok {
+					interval = str
+				}
+			case "filter":
+				if f, ok := elem.Value.(bson.D); ok {
+					filter = f
+				}
+			case "startTime":
+				if t, ok := elem.Value.(time.Time); ok {
+					startTime = t
+				} else if str, ok := elem.Value.(string); ok {
+					// 尝试解析时间字符串
+					t, err := time.Parse(time.RFC3339, str)
+					if err == nil {
+						startTime = t
+					}
+				}
+			case "endTime":
+				if t, ok := elem.Value.(time.Time); ok {
+					endTime = t
+				} else if str, ok := elem.Value.(string); ok {
+					// 尝试解析时间字符串
+					t, err := time.Parse(time.RFC3339, str)
+					if err == nil {
+						endTime = t
+					}
+				}
+			}
+		}
+
+		if dbName == "" || collName == "" || timeField == "" || valueField == "" {
+			return nil, fmt.Errorf("missing required parameters")
+		}
+
+		// 如果未指定插值方法，默认使用线性插值
+		if method == "" {
+			method = "linear"
+		}
+
+		// 如果未指定结束时间，使用当前时间
+		if endTime.IsZero() {
+			endTime = time.Now()
+		}
+
+		// 如果未指定开始时间，使用结束时间减去一天
+		if startTime.IsZero() {
+			startTime = endTime.Add(-24 * time.Hour)
+		}
+
+		// 获取查询引擎
+		queryEngine, ok := ctx.Value("queryEngine").(*query.QueryEngine)
+		if !ok {
+			return nil, fmt.Errorf("query engine not found in context")
+		}
+
+		// 创建插值请求
+		request := map[string]interface{}{
+			"database":   dbName,
+			"collection": collName,
+			"timeField":  timeField,
+			"valueField": valueField,
+			"method":     method,
+			"interval":   interval,
+			"filter":     filter,
+			"startTime":  startTime.UnixNano(),
+			"endTime":    endTime.UnixNano(),
+		}
+
+		// 执行插值
+		result, err := queryEngine.ExecuteInterpolation(ctx, request)
+		if err != nil {
+			return nil, fmt.Errorf("failed to execute interpolation: %w", err)
+		}
+
+		// 获取会话
+		session, ok := ctx.Value("session").(*Session)
+		if !ok {
+			return nil, fmt.Errorf("session not found in context")
+		}
+
+		// 转换结果为BSON文档
+		batch := make([]bson.D, 0, len(result))
+		for _, item := range result {
+			if doc, ok := item.(bson.D); ok {
+				batch = append(batch, doc)
+			} else if m, ok := item.(map[string]interface{}); ok {
+				// 转换map为bson.D
+				doc := bson.D{}
+				for k, v := range m {
+					doc = append(doc, bson.E{Key: k, Value: v})
+				}
+				batch = append(batch, doc)
+			}
+		}
+
+		// 创建游标
+		cursor := session.createCursor(dbName, collName, nil, batch)
+
+		// 创建响应
+		namespace := dbName + "." + collName
+		return createCursorResponse(namespace, cursor.ID, batch), nil
+	})
+
+	// 移动窗口命令
+	h.Register("movingWindow", func(ctx context.Context, cmd bson.D) (bson.D, error) {
+		var dbName, collName string
+		var timeField, valueField string
+		var windowSize int
+		var function string
+		var filter bson.D
+		var startTime, endTime time.Time
+
+		// 解析命令参数
+		for _, elem := range cmd {
+			switch elem.Key {
+			case "movingWindow":
+				if str, ok := elem.Value.(string); ok {
+					collName = str
+				}
+			case "$db":
+				if str, ok := elem.Value.(string); ok {
+					dbName = str
+				}
+			case "timeField":
+				if str, ok := elem.Value.(string); ok {
+					timeField = str
+				}
+			case "valueField":
+				if str, ok := elem.Value.(string); ok {
+					valueField = str
+				}
+			case "windowSize":
+				if val, ok := elem.Value.(int32); ok {
+					windowSize = int(val)
+				} else if val, ok := elem.Value.(int64); ok {
+					windowSize = int(val)
+				}
+			case "function":
+				if str, ok := elem.Value.(string); ok {
+					function = str
+				}
+			case "filter":
+				if f, ok := elem.Value.(bson.D); ok {
+					filter = f
+				}
+			case "startTime":
+				if t, ok := elem.Value.(time.Time); ok {
+					startTime = t
+				} else if str, ok := elem.Value.(string); ok {
+					// 尝试解析时间字符串
+					t, err := time.Parse(time.RFC3339, str)
+					if err == nil {
+						startTime = t
+					}
+				}
+			case "endTime":
+				if t, ok := elem.Value.(time.Time); ok {
+					endTime = t
+				} else if str, ok := elem.Value.(string); ok {
+					// 尝试解析时间字符串
+					t, err := time.Parse(time.RFC3339, str)
+					if err == nil {
+						endTime = t
+					}
+				}
+			}
+		}
+
+		if dbName == "" || collName == "" || timeField == "" || valueField == "" || windowSize <= 0 {
+			return nil, fmt.Errorf("missing required parameters")
+		}
+
+		// 如果未指定聚合函数，默认使用平均值
+		if function == "" {
+			function = "avg"
+		}
+
+		// 如果未指定结束时间，使用当前时间
+		if endTime.IsZero() {
+			endTime = time.Now()
+		}
+
+		// 如果未指定开始时间，使用结束时间减去一天
+		if startTime.IsZero() {
+			startTime = endTime.Add(-24 * time.Hour)
+		}
+
+		// 获取查询引擎
+		queryEngine, ok := ctx.Value("queryEngine").(*query.QueryEngine)
+		if !ok {
+			return nil, fmt.Errorf("query engine not found in context")
+		}
+
+		// 创建移动窗口请求
+		request := map[string]interface{}{
+			"database":   dbName,
+			"collection": collName,
+			"timeField":  timeField,
+			"valueField": valueField,
+			"windowSize": windowSize,
+			"function":   function,
+			"filter":     filter,
+			"startTime":  startTime.UnixNano(),
+			"endTime":    endTime.UnixNano(),
+		}
+
+		// 执行移动窗口
+		result, err := queryEngine.ExecuteMovingWindow(ctx, request)
+		if err != nil {
+			return nil, fmt.Errorf("failed to execute moving window: %w", err)
+		}
+
+		// 获取会话
+		session, ok := ctx.Value("session").(*Session)
+		if !ok {
+			return nil, fmt.Errorf("session not found in context")
+		}
+
+		// 转换结果为BSON文档
+		batch := make([]bson.D, 0, len(result))
+		for _, item := range result {
+			if doc, ok := item.(bson.D); ok {
+				batch = append(batch, doc)
+			} else if m, ok := item.(map[string]interface{}); ok {
+				// 转换map为bson.D
+				doc := bson.D{}
+				for k, v := range m {
+					doc = append(doc, bson.E{Key: k, Value: v})
+				}
+				batch = append(batch, doc)
+			}
+		}
+
+		// 创建游标
+		cursor := session.createCursor(dbName, collName, nil, batch)
+
+		// 创建响应
+		namespace := dbName + "." + collName
+		return createCursorResponse(namespace, cursor.ID, batch), nil
+	})
 }
 
 // sendMessage 发送消息到客户端
@@ -1003,4 +2149,468 @@ func (h *WireProtocolHandler) sendMessage(session *Session, msg *Message) error 
 	}
 
 	return nil
+}
+
+// createCursor 创建新的游标
+func (session *Session) createCursor(database, collection string, query bson.D, batch []bson.D) *Cursor {
+	session.mu.Lock()
+	defer session.mu.Unlock()
+
+	// 生成新的游标ID
+	cursorID := session.nextCursor
+	session.nextCursor++
+
+	// 如果批次为空，则设置为已耗尽
+	exhausted := len(batch) == 0
+
+	// 创建游标
+	cursor := &Cursor{
+		ID:         cursorID,
+		Query:      query,
+		Database:   database,
+		Collection: collection,
+		Batch:      batch,
+		Position:   0,
+		Exhausted:  exhausted,
+		CreatedAt:  time.Now(),
+		LastUsed:   time.Now(),
+	}
+
+	// 如果游标未耗尽，则保存到映射中
+	if !exhausted {
+		if session.cursorMap == nil {
+			session.cursorMap = make(map[int64]*Cursor)
+		}
+		session.cursorMap[cursorID] = cursor
+	}
+
+	return cursor
+}
+
+// getCursor 获取游标
+func (session *Session) getCursor(cursorID int64) *Cursor {
+	session.mu.Lock()
+	defer session.mu.Unlock()
+
+	if session.cursorMap == nil {
+		return nil
+	}
+
+	cursor := session.cursorMap[cursorID]
+	if cursor != nil {
+		// 更新游标最后使用时间
+		cursor.LastUsed = time.Now()
+	}
+
+	return cursor
+}
+
+// removeCursor 移除游标
+func (session *Session) removeCursor(cursorID int64) {
+	session.mu.Lock()
+	defer session.mu.Unlock()
+
+	if session.cursorMap != nil {
+		delete(session.cursorMap, cursorID)
+	}
+}
+
+// getNextBatch 获取游标的下一批数据
+func (cursor *Cursor) getNextBatch(batchSize int) []bson.D {
+	if cursor.Exhausted || cursor.Position >= len(cursor.Batch) {
+		cursor.Exhausted = true
+		return nil
+	}
+
+	// 计算批次结束位置
+	end := cursor.Position + batchSize
+	if end > len(cursor.Batch) {
+		end = len(cursor.Batch)
+	}
+
+	// 获取批次
+	batch := cursor.Batch[cursor.Position:end]
+
+	// 更新位置
+	cursor.Position = end
+
+	// 检查是否已耗尽
+	if cursor.Position >= len(cursor.Batch) {
+		cursor.Exhausted = true
+	}
+
+	return batch
+}
+
+// createCursorResponse 创建游标响应
+func createCursorResponse(namespace string, cursorID int64, batch []bson.D) bson.D {
+	return bson.D{
+		{"cursor", bson.D{
+			{"id", cursorID},
+			{"ns", namespace},
+			{"firstBatch", batchToBsonA(batch)},
+		}},
+		{"ok", 1},
+	}
+}
+
+// createGetMoreResponse 创建getMore响应
+func createGetMoreResponse(namespace string, cursorID int64, batch []bson.D) bson.D {
+	return bson.D{
+		{"cursor", bson.D{
+			{"id", cursorID},
+			{"ns", namespace},
+			{"nextBatch", batchToBsonA(batch)},
+		}},
+		{"ok", 1},
+	}
+}
+
+// batchToBsonA 将批次转换为BSON数组
+func batchToBsonA(batch []bson.D) bson.A {
+	result := make(bson.A, len(batch))
+	for i, doc := range batch {
+		result[i] = doc
+	}
+	return result
+}
+
+// updateActivity 更新会话活动时间
+func (session *Session) updateActivity() {
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	session.lastActive = time.Now()
+}
+
+// cleanupCursors 清理过期的游标
+func (session *Session) cleanupCursors(maxIdleTime time.Duration) int {
+	session.mu.Lock()
+	defer session.mu.Unlock()
+
+	now := time.Now()
+	count := 0
+
+	for id, cursor := range session.cursorMap {
+		// 如果游标已经超时，则删除
+		if now.Sub(cursor.LastUsed) > maxIdleTime {
+			delete(session.cursorMap, id)
+			count++
+		}
+	}
+
+	return count
+}
+
+// cleanupLoop 清理过期的游标和会话
+func (h *WireProtocolHandler) cleanupLoop() {
+	for {
+		select {
+		case <-h.cleanupTicker.C:
+			h.cleanupCursorsAndSessions()
+		case <-h.closing:
+			h.cleanupTicker.Stop()
+			return
+		}
+	}
+}
+
+// cleanupCursorsAndSessions 清理过期的游标和会话
+func (h *WireProtocolHandler) cleanupCursorsAndSessions() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	now := time.Now()
+	sessionTimeout := 30 * time.Minute // 会话超时时间
+
+	// 清理过期的会话和游标
+	for id, session := range h.sessions {
+		// 清理过期的游标
+		count := session.cleanupCursors(h.cursorTTL)
+		if count > 0 {
+			fmt.Printf("Cleaned up %d expired cursors for session %d\n", count, id)
+		}
+
+		// 如果会话已经超时，则关闭并删除
+		if now.Sub(session.lastActive) > sessionTimeout {
+			fmt.Printf("Closing inactive session %d\n", id)
+			session.Conn.Close()
+			delete(h.sessions, id)
+		}
+	}
+}
+
+// batchWorker 批处理工作线程
+func (h *WireProtocolHandler) batchWorker() {
+	// 按操作类型和集合分组的批处理操作
+	insertBatches := make(map[string][]*batchOperation)
+	updateBatches := make(map[string][]*batchOperation)
+	deleteBatches := make(map[string][]*batchOperation)
+
+	// 批处理定时器
+	ticker := time.NewTicker(h.batchInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-h.closing:
+			// 处理器关闭，退出工作线程
+			return
+
+		case op := <-h.batchQueue:
+			// 将操作添加到相应的批处理组
+			key := op.database + "." + op.collection
+
+			switch op.opType {
+			case "insert":
+				insertBatches[key] = append(insertBatches[key], op)
+				// 如果批处理达到大小限制，立即处理
+				if len(insertBatches[key]) >= h.batchSize {
+					h.processBatch("insert", key, insertBatches[key])
+					insertBatches[key] = nil
+				}
+
+			case "update":
+				updateBatches[key] = append(updateBatches[key], op)
+				// 如果批处理达到大小限制，立即处理
+				if len(updateBatches[key]) >= h.batchSize {
+					h.processBatch("update", key, updateBatches[key])
+					updateBatches[key] = nil
+				}
+
+			case "delete":
+				deleteBatches[key] = append(deleteBatches[key], op)
+				// 如果批处理达到大小限制，立即处理
+				if len(deleteBatches[key]) >= h.batchSize {
+					h.processBatch("delete", key, deleteBatches[key])
+					deleteBatches[key] = nil
+				}
+			}
+
+		case <-ticker.C:
+			// 定时处理所有批处理
+			for key, batch := range insertBatches {
+				if len(batch) > 0 {
+					h.processBatch("insert", key, batch)
+					insertBatches[key] = nil
+				}
+			}
+
+			for key, batch := range updateBatches {
+				if len(batch) > 0 {
+					h.processBatch("update", key, batch)
+					updateBatches[key] = nil
+				}
+			}
+
+			for key, batch := range deleteBatches {
+				if len(batch) > 0 {
+					h.processBatch("delete", key, batch)
+					deleteBatches[key] = nil
+				}
+			}
+		}
+	}
+}
+
+// processBatch 处理批处理
+func (h *WireProtocolHandler) processBatch(opType, key string, batch []*batchOperation) {
+	if len(batch) == 0 {
+		return
+	}
+
+	// 解析数据库和集合
+	parts := strings.Split(key, ".")
+	if len(parts) != 2 {
+		// 无效的键，返回错误
+		for _, op := range batch {
+			op.resultCh <- batchResult{
+				count: 0,
+				err:   fmt.Errorf("invalid key: %s", key),
+			}
+		}
+		return
+	}
+
+	dbName, collName := parts[0], parts[1]
+
+	// 根据操作类型处理批处理
+	switch opType {
+	case "insert":
+		// 合并所有文档
+		allDocs := make([]bson.D, 0, len(batch)*10) // 假设每个操作平均有10个文档
+		for _, op := range batch {
+			allDocs = append(allDocs, op.documents...)
+		}
+
+		// 执行批量插入
+		ctx := context.Background()
+		count, err := h.executeBulkInsert(ctx, dbName, collName, allDocs)
+
+		// 返回结果
+		for _, op := range batch {
+			op.resultCh <- batchResult{
+				count: count / len(batch), // 平均分配影响的文档数
+				err:   err,
+			}
+		}
+
+	case "update":
+		// 暂时不支持批量更新，逐个处理
+		for _, op := range batch {
+			ctx := context.Background()
+			count, err := h.executeBulkUpdate(ctx, dbName, collName, op.filter, op.update)
+
+			op.resultCh <- batchResult{
+				count: count,
+				err:   err,
+			}
+		}
+
+	case "delete":
+		// 暂时不支持批量删除，逐个处理
+		for _, op := range batch {
+			ctx := context.Background()
+			count, err := h.executeBulkDelete(ctx, dbName, collName, op.filter)
+
+			op.resultCh <- batchResult{
+				count: count,
+				err:   err,
+			}
+		}
+	}
+}
+
+// executeBulkInsert 执行批量插入
+func (h *WireProtocolHandler) executeBulkInsert(ctx context.Context, dbName, collName string, documents []bson.D) (int, error) {
+	// 创建插入命令
+	cmd := bson.D{
+		{"insert", collName},
+		{"$db", dbName},
+		{"documents", documents},
+	}
+
+	// 执行命令
+	result, err := h.cmdHandler.Execute(ctx, cmd)
+	if err != nil {
+		return 0, err
+	}
+
+	// 解析结果
+	for _, elem := range result {
+		if elem.Key == "n" {
+			if n, ok := elem.Value.(int); ok {
+				return n, nil
+			}
+		}
+	}
+
+	return len(documents), nil // 假设所有文档都插入成功
+}
+
+// executeBulkUpdate 执行批量更新
+func (h *WireProtocolHandler) executeBulkUpdate(ctx context.Context, dbName, collName string, filter, update bson.D) (int, error) {
+	// 创建更新命令
+	cmd := bson.D{
+		{"update", collName},
+		{"$db", dbName},
+		{"updates", bson.A{
+			bson.D{
+				{"q", filter},
+				{"u", update},
+				{"multi", true},
+			},
+		}},
+	}
+
+	// 执行命令
+	result, err := h.cmdHandler.Execute(ctx, cmd)
+	if err != nil {
+		return 0, err
+	}
+
+	// 解析结果
+	for _, elem := range result {
+		if elem.Key == "n" {
+			if n, ok := elem.Value.(int); ok {
+				return n, nil
+			}
+		}
+	}
+
+	return 0, nil
+}
+
+// executeBulkDelete 执行批量删除
+func (h *WireProtocolHandler) executeBulkDelete(ctx context.Context, dbName, collName string, filter bson.D) (int, error) {
+	// 创建删除命令
+	cmd := bson.D{
+		{"delete", collName},
+		{"$db", dbName},
+		{"deletes", bson.A{
+			bson.D{
+				{"q", filter},
+				{"limit", 0}, // 0表示删除所有匹配的文档
+			},
+		}},
+	}
+
+	// 执行命令
+	result, err := h.cmdHandler.Execute(ctx, cmd)
+	if err != nil {
+		return 0, err
+	}
+
+	// 解析结果
+	for _, elem := range result {
+		if elem.Key == "n" {
+			if n, ok := elem.Value.(int); ok {
+				return n, nil
+			}
+		}
+	}
+
+	return 0, nil
+}
+
+// queueBatchOperation 将操作添加到批处理队列
+func (h *WireProtocolHandler) queueBatchOperation(op *batchOperation) batchResult {
+	// 创建结果通道
+	op.resultCh = make(chan batchResult, 1)
+
+	// 将操作添加到队列
+	select {
+	case h.batchQueue <- op:
+		// 操作已添加到队列，等待结果
+		result := <-op.resultCh
+		return result
+
+	case <-time.After(1 * time.Second):
+		// 队列已满或超时，直接处理
+		ctx := context.Background()
+
+		switch op.opType {
+		case "insert":
+			count, err := h.executeBulkInsert(ctx, op.database, op.collection, op.documents)
+			return batchResult{count: count, err: err}
+
+		case "update":
+			count, err := h.executeBulkUpdate(ctx, op.database, op.collection, op.filter, op.update)
+			return batchResult{count: count, err: err}
+
+		case "delete":
+			count, err := h.executeBulkDelete(ctx, op.database, op.collection, op.filter)
+			return batchResult{count: count, err: err}
+
+		default:
+			return batchResult{count: 0, err: fmt.Errorf("unknown operation type: %s", op.opType)}
+		}
+	}
+}
+
+// 在 WireProtocolHandler 中添加一个静态变量来存储启动时间
+var serverStartTime = time.Now()
+
+// 获取服务器运行时间（秒）
+func getUptime() int64 {
+	return int64(time.Since(serverStartTime).Seconds())
 }
