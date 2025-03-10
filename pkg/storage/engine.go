@@ -34,7 +34,8 @@ type StorageEngine struct {
 	indexMgr     index.IndexManager         // 索引管理器
 	flushTicker  *time.Ticker               // 刷盘定时器
 	storageTiers []model.StorageTier        // 存储层级
-	mu           sync.RWMutex               // 读写锁
+	mu           sync.RWMutex               // 读写锁（旧的锁，将逐步替换）
+	lockManager  *LockManager               // 锁管理器
 	closing      chan struct{}              // 关闭信号
 }
 
@@ -51,77 +52,49 @@ type TimeRange struct {
 
 // NewStorageEngine 创建新的存储引擎
 func NewStorageEngine(baseDir string) (*StorageEngine, error) {
-	// 创建目录结构
-	dataDir := baseDir // 直接使用 baseDir 作为数据目录
+	// 创建目录
+	dataDir := filepath.Join(baseDir, "data")
 	walDir := filepath.Join(baseDir, "wal")
 	metaDir := filepath.Join(baseDir, "meta")
 	coldDir := filepath.Join(baseDir, "cold")
 
-	for _, dir := range []string{dataDir, walDir, metaDir, coldDir} {
+	// 确保目录存在
+	dirs := []string{dataDir, walDir, metaDir, coldDir}
+	for _, dir := range dirs {
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			return nil, fmt.Errorf("failed to create directory %s: %w", dir, err)
 		}
 	}
+
+	// 创建存储引擎
+	engine := &StorageEngine{
+		dataDir:     dataDir,
+		walDir:      walDir,
+		metaDir:     metaDir,
+		coldDir:     coldDir,
+		databases:   make(map[string]*model.Database),
+		memTables:   make(map[string]*MemTable),
+		lockManager: NewLockManager(true), // 启用调试日志
+		closing:     make(chan struct{}),
+	}
+
+	// 创建索引管理器
+	indexMgr := index.NewIndexManager()
+	engine.indexMgr = indexMgr
 
 	// 创建WAL
 	wal, err := NewWAL(walDir, 0)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create WAL: %w", err)
 	}
-
-	// 创建索引管理器
-	indexMgr := index.NewIndexManager()
-
-	// 定义默认存储层级
-	defaultTiers := []model.StorageTier{
-		{
-			Name:      "hot",
-			Type:      "memory",
-			Priority:  1,
-			MaxAge:    24 * time.Hour,
-			ReadOnly:  false,
-			Compress:  false,
-			BatchSize: 1000,
-		},
-		{
-			Name:      "warm",
-			Type:      "ssd",
-			Priority:  2,
-			MaxAge:    7 * 24 * time.Hour,
-			ReadOnly:  false,
-			Compress:  true,
-			BatchSize: 10000,
-		},
-		{
-			Name:      "cold",
-			Type:      "hdd",
-			Priority:  3,
-			MaxAge:    30 * 24 * time.Hour,
-			ReadOnly:  true,
-			Compress:  true,
-			BatchSize: 50000,
-		},
-	}
-
-	engine := &StorageEngine{
-		dataDir:      dataDir,
-		walDir:       walDir,
-		metaDir:      metaDir,
-		coldDir:      coldDir,
-		databases:    make(map[string]*model.Database),
-		memTables:    make(map[string]*MemTable),
-		wal:          wal,
-		indexMgr:     indexMgr,
-		storageTiers: defaultTiers,
-		closing:      make(chan struct{}),
-	}
+	engine.wal = wal
 
 	// 加载元数据
 	if err := engine.loadMetadata(); err != nil {
 		return nil, fmt.Errorf("failed to load metadata: %w", err)
 	}
 
-	// 从WAL恢复数据
+	// 从WAL恢复
 	if err := engine.recoverFromWAL(); err != nil {
 		return nil, fmt.Errorf("failed to recover from WAL: %w", err)
 	}
@@ -141,60 +114,40 @@ func NewQueryOptimizer(engine *StorageEngine) *QueryOptimizer {
 
 // loadMetadata 加载元数据
 func (e *StorageEngine) loadMetadata() error {
-	fmt.Printf("开始加载元数据\n")
+	fmt.Println("开始加载元数据")
 
+	// 获取全局写锁
+	unlock := e.lockManager.LockGlobal(true)
+	defer unlock()
+
+	// 读取元数据文件
 	metadataPath := filepath.Join(e.dataDir, "metadata.json")
+	fmt.Printf("读取元数据文件: %s\n", metadataPath)
 
-	// 检查元数据文件是否存在
+	// 检查文件是否存在
 	if _, err := os.Stat(metadataPath); os.IsNotExist(err) {
-		// 元数据文件不存在，初始化空数据库
-		fmt.Printf("元数据文件不存在，初始化空数据库\n")
-		e.databases = make(map[string]*model.Database)
+		fmt.Println("元数据文件不存在，使用空数据库")
 		return nil
 	}
 
-	// 读取元数据文件
-	fmt.Printf("读取元数据文件: %s\n", metadataPath)
+	// 读取文件内容
 	data, err := os.ReadFile(metadataPath)
 	if err != nil {
-		fmt.Printf("读取元数据文件失败: %v\n", err)
 		return fmt.Errorf("failed to read metadata file: %w", err)
 	}
 
 	// 解析元数据
-	fmt.Printf("解析元数据\n")
-	var metadata map[string]interface{}
-
+	fmt.Println("解析元数据")
+	var metadata struct {
+		Databases map[string]map[string]interface{} `json:"databases"`
+	}
 	if err := json.Unmarshal(data, &metadata); err != nil {
-		fmt.Printf("解析元数据失败: %v\n", err)
 		return fmt.Errorf("failed to unmarshal metadata: %w", err)
 	}
 
-	// 初始化数据库映射
-	e.databases = make(map[string]*model.Database)
-
-	// 解析数据库
-	databasesData, ok := metadata["databases"]
-	if !ok {
-		fmt.Printf("元数据中没有数据库信息\n")
-		return nil
-	}
-
-	databasesMap, ok := databasesData.(map[string]interface{})
-	if !ok {
-		fmt.Printf("数据库信息格式不正确\n")
-		return fmt.Errorf("invalid databases format")
-	}
-
-	// 遍历数据库
-	for dbName, dbData := range databasesMap {
+	// 加载数据库
+	for dbName, dbMap := range metadata.Databases {
 		fmt.Printf("加载数据库: %s\n", dbName)
-
-		dbMap, ok := dbData.(map[string]interface{})
-		if !ok {
-			fmt.Printf("数据库 %s 格式不正确\n", dbName)
-			continue
-		}
 
 		// 创建数据库对象
 		db := &model.Database{
@@ -375,11 +328,12 @@ func (e *StorageEngine) saveMetadata(alreadyLocked ...bool) error {
 		fmt.Printf("saveMetadata: 调用者已持有锁，跳过加锁\n")
 	}
 
-	// 如果没有持有锁，则加锁
+	// 如果没有持有锁，则获取全局读锁
+	var unlock func()
 	if !isAlreadyLocked {
-		e.mu.Lock()
+		unlock = e.lockManager.LockGlobal(false)
 		defer func() {
-			e.mu.Unlock()
+			unlock()
 			fmt.Printf("saveMetadata: 解锁完成\n")
 		}()
 	}
@@ -565,8 +519,9 @@ func (e *StorageEngine) flushMemTables() {
 func (e *StorageEngine) getOrCreateMemTable(dbName, tableName string) (*MemTable, error) {
 	key := dbName + ":" + tableName
 
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	// 获取全局写锁
+	unlock := e.lockManager.LockGlobal(true)
+	defer unlock()
 
 	if memTable, exists := e.memTables[key]; exists {
 		return memTable, nil
@@ -583,9 +538,10 @@ func (e *StorageEngine) getOrCreateMemTable(dbName, tableName string) (*MemTable
 func (e *StorageEngine) CreateDatabase(name string, retentionPolicy model.RetentionPolicy) error {
 	fmt.Printf("开始创建数据库: %s\n", name)
 
-	e.mu.Lock()
+	// 获取全局写锁
+	unlock := e.lockManager.LockGlobal(true)
 	defer func() {
-		e.mu.Unlock()
+		unlock()
 		fmt.Printf("CreateDatabase: 解锁完成\n")
 	}()
 
@@ -632,8 +588,12 @@ func (e *StorageEngine) CreateDatabase(name string, retentionPolicy model.Retent
 func (e *StorageEngine) CreateTable(dbName, tableName string, schema model.Schema, tagIndexes []model.TagIndex) error {
 	fmt.Printf("开始创建表 %s.%s\n", dbName, tableName)
 
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	// 获取数据库写锁
+	unlock := e.lockManager.LockDatabase(dbName, true)
+	defer func() {
+		unlock()
+		fmt.Printf("CreateTable: 解锁完成\n")
+	}()
 
 	db, exists := e.databases[dbName]
 	if !exists {
@@ -755,20 +715,20 @@ func (e *StorageEngine) CreateTable(dbName, tableName string, schema model.Schem
 
 // InsertPoint 插入时序数据点
 func (e *StorageEngine) InsertPoint(dbName, tableName string, point *model.TimeSeriesPoint) error {
+	// 获取表读锁
+	unlock := e.lockManager.LockTable(dbName, tableName, false)
+	defer unlock()
+
 	// 检查数据库和表是否存在
-	e.mu.RLock()
 	db, dbExists := e.databases[dbName]
 	if !dbExists {
-		e.mu.RUnlock()
 		return fmt.Errorf("database %s does not exist", dbName)
 	}
 
 	table, tableExists := db.Tables[tableName]
 	if !tableExists {
-		e.mu.RUnlock()
 		return fmt.Errorf("table %s does not exist in database %s", tableName, dbName)
 	}
-	e.mu.RUnlock()
 
 	// 创建WAL条目
 	doc := point.ToBSON()
@@ -1054,9 +1014,10 @@ func (e *StorageEngine) ListDatabases() ([]*model.Database, error) {
 func (e *StorageEngine) DropDatabase(dbName string) error {
 	fmt.Printf("开始删除数据库: %s\n", dbName)
 
-	e.mu.Lock()
+	// 获取全局写锁
+	unlock := e.lockManager.LockGlobal(true)
 	defer func() {
-		e.mu.Unlock()
+		unlock()
 		fmt.Printf("DropDatabase: 解锁完成\n")
 	}()
 
@@ -1081,7 +1042,21 @@ func (e *StorageEngine) DropDatabase(dbName string) error {
 	delete(e.databases, dbName)
 	fmt.Printf("内存中的数据库对象删除成功\n")
 
-	// 保存元数据
+	// 删除相关的内存表
+	fmt.Printf("删除相关的内存表\n")
+	prefix := dbName + ":"
+	for key := range e.memTables {
+		if strings.HasPrefix(key, prefix) {
+			delete(e.memTables, key)
+		}
+	}
+	fmt.Printf("内存表删除成功\n")
+
+	// 移除数据库相关的所有锁
+	e.lockManager.RemoveDatabaseLocks(dbName)
+	fmt.Printf("数据库相关的锁已移除\n")
+
+	// 保存更新后的元数据
 	fmt.Printf("保存更新后的元数据\n")
 	if err := e.saveMetadata(true); err != nil {
 		fmt.Printf("保存元数据失败: %v\n", err)
@@ -1097,9 +1072,10 @@ func (e *StorageEngine) DropDatabase(dbName string) error {
 func (e *StorageEngine) DropTable(dbName, tableName string) error {
 	fmt.Printf("开始删除表: %s.%s\n", dbName, tableName)
 
-	e.mu.Lock()
+	// 获取数据库写锁
+	unlock := e.lockManager.LockDatabase(dbName, true)
 	defer func() {
-		e.mu.Unlock()
+		unlock()
 		fmt.Printf("DropTable: 解锁完成\n")
 	}()
 
@@ -1131,7 +1107,19 @@ func (e *StorageEngine) DropTable(dbName, tableName string) error {
 	delete(db.Tables, tableName)
 	fmt.Printf("内存中的表对象删除成功\n")
 
-	// 保存元数据
+	// 删除内存表
+	memTableKey := dbName + ":" + tableName
+	if _, exists := e.memTables[memTableKey]; exists {
+		fmt.Printf("删除内存表\n")
+		delete(e.memTables, memTableKey)
+		fmt.Printf("内存表删除成功\n")
+	}
+
+	// 移除表锁
+	e.lockManager.RemoveTableLock(dbName, tableName)
+	fmt.Printf("表锁已移除\n")
+
+	// 保存更新后的元数据
 	fmt.Printf("保存更新后的元数据\n")
 	if err := e.saveMetadata(true); err != nil {
 		fmt.Printf("保存元数据失败: %v\n", err)
@@ -2215,13 +2203,13 @@ func getDirSize(path string) (int64, error) {
 func (e *StorageEngine) ClearTable(dbName, tableName string) error {
 	fmt.Printf("开始清空表: %s.%s\n", dbName, tableName)
 
-	// 第一阶段：获取锁，检查数据库和表是否存在，删除数据文件
-	e.mu.Lock()
+	// 第一阶段：获取数据库锁和表锁，检查数据库和表是否存在
+	unlock := e.lockManager.LockMulti(false, map[string]bool{dbName: true}, map[string]bool{dbName + ":" + tableName: true})
 
 	// 检查数据库是否存在
 	db, exists := e.databases[dbName]
 	if !exists {
-		e.mu.Unlock()
+		unlock()
 		fmt.Printf("数据库 %s 不存在\n", dbName)
 		return fmt.Errorf("database %s does not exist", dbName)
 	}
@@ -2229,7 +2217,7 @@ func (e *StorageEngine) ClearTable(dbName, tableName string) error {
 	// 检查表是否存在
 	table, exists := db.Tables[tableName]
 	if !exists {
-		e.mu.Unlock()
+		unlock()
 		fmt.Printf("表 %s 在数据库 %s 中不存在\n", tableName, dbName)
 		return fmt.Errorf("table %s does not exist in database %s", tableName, dbName)
 	}
@@ -2242,7 +2230,7 @@ func (e *StorageEngine) ClearTable(dbName, tableName string) error {
 	// 获取表中的数据文件
 	dataFiles, err := filepath.Glob(filepath.Join(tableDir, "*.data"))
 	if err != nil {
-		e.mu.Unlock()
+		unlock()
 		fmt.Printf("获取数据文件失败: %v\n", err)
 		return fmt.Errorf("failed to get data files: %w", err)
 	}
@@ -2252,7 +2240,7 @@ func (e *StorageEngine) ClearTable(dbName, tableName string) error {
 	for _, file := range dataFiles {
 		fmt.Printf("删除数据文件: %s\n", file)
 		if err := os.Remove(file); err != nil {
-			e.mu.Unlock()
+			unlock()
 			fmt.Printf("删除数据文件失败: %v\n", err)
 			return fmt.Errorf("failed to remove data file %s: %w", file, err)
 		}
@@ -2275,7 +2263,7 @@ func (e *StorageEngine) ClearTable(dbName, tableName string) error {
 	}
 
 	// 释放锁
-	e.mu.Unlock()
+	unlock()
 	fmt.Printf("ClearTable: 第一阶段完成，释放锁\n")
 
 	// 第二阶段：重建索引（不需要锁）
