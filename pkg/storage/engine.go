@@ -531,28 +531,28 @@ func (e *StorageEngine) getOrCreateMemTable(dbName, tableName string) (*MemTable
 
 // CreateDatabase 创建数据库
 func (e *StorageEngine) CreateDatabase(name string, retentionPolicy model.RetentionPolicy) error {
-	fmt.Printf("开始创建数据库: %s\n", name)
+	logger.Printf("开始创建数据库: %s\n", name)
 
 	// 获取全局写锁
 	unlock := e.lockManager.LockGlobal(true)
 	defer func() {
 		unlock()
-		fmt.Printf("CreateDatabase: 解锁完成\n")
+		logger.Printf("CreateDatabase: 解锁完成\n")
 	}()
 
 	if _, exists := e.databases[name]; exists {
-		fmt.Printf("数据库 %s 已存在\n", name)
+		logger.Printf("数据库 %s 已存在\n", name)
 		return fmt.Errorf("database %s already exists", name)
 	}
 
 	// 创建数据库目录
 	dbDir := filepath.Join(e.dataDir, name)
-	fmt.Printf("创建数据库目录: %s\n", dbDir)
+	logger.Printf("创建数据库目录: %s\n", dbDir)
 	if err := os.MkdirAll(dbDir, 0755); err != nil {
-		fmt.Printf("创建数据库目录失败: %v\n", err)
+		logger.Printf("创建数据库目录失败: %v\n", err)
 		return fmt.Errorf("failed to create database directory: %w", err)
 	}
-	fmt.Printf("数据库目录创建成功\n")
+	logger.Printf("数据库目录创建成功\n")
 
 	// 创建数据库对象
 	db := &model.Database{
@@ -561,51 +561,51 @@ func (e *StorageEngine) CreateDatabase(name string, retentionPolicy model.Retent
 		Tables:          make(map[string]*model.Table),
 	}
 
-	fmt.Printf("添加数据库 %s 到映射\n", name)
+	logger.Printf("添加数据库 %s 到映射\n", name)
 	e.databases[name] = db
-	fmt.Printf("数据库添加到映射成功\n")
+	logger.Printf("数据库添加到映射成功\n")
 
 	// 保存元数据
-	fmt.Printf("保存数据库 %s 的元数据\n", name)
+	logger.Printf("保存数据库 %s 的元数据\n", name)
 	if err := e.saveMetadata(true); err != nil {
-		fmt.Printf("保存数据库 %s 的元数据失败: %v\n", name, err)
+		logger.Printf("保存数据库 %s 的元数据失败: %v\n", name, err)
 		// 回滚操作
 		delete(e.databases, name)
 		return fmt.Errorf("failed to save metadata: %w", err)
 	}
-	fmt.Printf("保存数据库 %s 的元数据成功\n", name)
+	logger.Printf("保存数据库 %s 的元数据成功\n", name)
 
-	fmt.Printf("数据库 %s 创建成功\n", name)
+	logger.Printf("数据库 %s 创建成功\n", name)
 	return nil
 }
 
 // CreateTable 创建表
 func (e *StorageEngine) CreateTable(dbName, tableName string, schema model.Schema, tagIndexes []model.TagIndex) error {
-	fmt.Printf("开始创建表 %s.%s\n", dbName, tableName)
+	logger.Printf("开始创建表 %s.%s\n", dbName, tableName)
 
 	// 获取数据库写锁
 	unlock := e.lockManager.LockDatabase(dbName, true)
 	defer func() {
 		unlock()
-		fmt.Printf("CreateTable: 解锁完成\n")
+		logger.Printf("CreateTable: 解锁完成\n")
 	}()
 
 	db, exists := e.databases[dbName]
 	if !exists {
-		fmt.Printf("数据库 %s 不存在\n", dbName)
+		logger.Printf("数据库 %s 不存在\n", dbName)
 		return fmt.Errorf("database %s does not exist", dbName)
 	}
 
 	if _, exists := db.Tables[tableName]; exists {
-		fmt.Printf("表 %s 已存在于数据库 %s 中\n", tableName, dbName)
+		logger.Printf("表 %s 已存在于数据库 %s 中\n", tableName, dbName)
 		return fmt.Errorf("table %s already exists in database %s", tableName, dbName)
 	}
 
 	// 创建表目录
 	tableDir := filepath.Join(e.dataDir, dbName, tableName)
-	fmt.Printf("创建表目录: %s\n", tableDir)
+	logger.Printf("创建表目录: %s\n", tableDir)
 	if err := os.MkdirAll(tableDir, 0755); err != nil {
-		fmt.Printf("创建表目录失败: %v\n", err)
+		logger.Printf("创建表目录失败: %v\n", err)
 		return fmt.Errorf("failed to create table directory: %w", err)
 	}
 
@@ -617,12 +617,12 @@ func (e *StorageEngine) CreateTable(dbName, tableName string, schema model.Schem
 		TagIndexes: tagIndexes,
 	}
 
-	fmt.Printf("添加表 %s 到数据库 %s\n", tableName, dbName)
+	logger.Printf("添加表 %s 到数据库 %s\n", tableName, dbName)
 	db.Tables[tableName] = table
 
 	// 创建索引
 	if tagIndexes != nil && len(tagIndexes) > 0 {
-		fmt.Printf("开始创建 %d 个标签索引\n", len(tagIndexes))
+		logger.Printf("开始创建 %d 个标签索引\n", len(tagIndexes))
 		ctx := context.Background()
 		for _, tagIndex := range tagIndexes {
 			// 转换索引类型
@@ -655,21 +655,21 @@ func (e *StorageEngine) CreateTable(dbName, tableName string, schema model.Schem
 				SupportRegex:        tagIndex.SupportRegex,
 			}
 
-			fmt.Printf("创建索引 %s\n", tagIndex.Name)
+			logger.Printf("创建索引 %s\n", tagIndex.Name)
 			// 创建索引
 			_, err := e.indexMgr.CreateIndex(ctx, dbName, tableName, options)
 			if err != nil {
-				fmt.Printf("创建索引 %s 失败: %v\n", tagIndex.Name, err)
+				logger.Printf("创建索引 %s 失败: %v\n", tagIndex.Name, err)
 				return fmt.Errorf("failed to create index %s: %w", tagIndex.Name, err)
 			}
 		}
 	} else {
-		fmt.Printf("没有标签索引需要创建\n")
+		logger.Printf("没有标签索引需要创建\n")
 	}
 
 	// 创建时间索引
 	if schema.TimeField != "" {
-		fmt.Printf("开始创建时间索引，时间字段: %s\n", schema.TimeField)
+		logger.Printf("开始创建时间索引，时间字段: %s\n", schema.TimeField)
 		timeIndexOptions := index.TimeIndexOptions{
 			Name:      "time_idx",
 			TimeField: schema.TimeField,
@@ -687,24 +687,24 @@ func (e *StorageEngine) CreateTable(dbName, tableName string, schema model.Schem
 		}
 
 		ctx := context.Background()
-		fmt.Printf("注册时间索引\n")
+		logger.Printf("注册时间索引\n")
 		_, err := e.indexMgr.CreateIndex(ctx, dbName, tableName, options)
 		if err != nil {
-			fmt.Printf("创建时间索引失败: %v\n", err)
+			logger.Printf("创建时间索引失败: %v\n", err)
 			return fmt.Errorf("failed to create time index: %w", err)
 		}
 	} else {
-		fmt.Printf("没有时间字段，跳过创建时间索引\n")
+		logger.Printf("没有时间字段，跳过创建时间索引\n")
 	}
 
 	// 保存元数据
-	fmt.Printf("保存元数据\n")
+	logger.Printf("保存元数据\n")
 	if err := e.saveMetadata(true); err != nil {
-		fmt.Printf("保存元数据失败: %v\n", err)
+		logger.Printf("保存元数据失败: %v\n", err)
 		return fmt.Errorf("failed to save metadata: %w", err)
 	}
 
-	fmt.Printf("表 %s.%s 创建成功\n", dbName, tableName)
+	logger.Printf("表 %s.%s 创建成功\n", dbName, tableName)
 	return nil
 }
 
@@ -1007,122 +1007,107 @@ func (e *StorageEngine) ListDatabases() ([]*model.Database, error) {
 
 // DropDatabase 删除数据库
 func (e *StorageEngine) DropDatabase(dbName string) error {
-	fmt.Printf("开始删除数据库: %s\n", dbName)
+	logger.Printf("开始删除数据库: %s\n", dbName)
 
 	// 获取全局写锁
 	unlock := e.lockManager.LockGlobal(true)
 	defer func() {
 		unlock()
-		fmt.Printf("DropDatabase: 解锁完成\n")
+		logger.Printf("DropDatabase: 解锁完成\n")
 	}()
 
 	// 检查数据库是否存在
 	if _, exists := e.databases[dbName]; !exists {
-		fmt.Printf("数据库 %s 不存在\n", dbName)
+		logger.Printf("数据库 %s 不存在\n", dbName)
 		return fmt.Errorf("database %s does not exist", dbName)
 	}
-	fmt.Printf("数据库 %s 存在，准备删除\n", dbName)
+	logger.Printf("数据库 %s 存在，准备删除\n", dbName)
 
 	// 删除数据库目录
 	dbPath := filepath.Join(e.dataDir, dbName)
-	fmt.Printf("删除数据库目录: %s\n", dbPath)
+	logger.Printf("删除数据库目录: %s\n", dbPath)
 	if err := os.RemoveAll(dbPath); err != nil {
-		fmt.Printf("删除数据库目录失败: %v\n", err)
+		logger.Printf("删除数据库目录失败: %v\n", err)
 		return fmt.Errorf("failed to remove database directory: %w", err)
 	}
-	fmt.Printf("数据库目录删除成功\n")
+	logger.Printf("数据库目录删除成功\n")
 
 	// 删除内存中的数据库对象
-	fmt.Printf("从内存中删除数据库对象\n")
+	logger.Printf("从内存中删除数据库对象\n")
 	delete(e.databases, dbName)
-	fmt.Printf("内存中的数据库对象删除成功\n")
+	logger.Printf("内存中的数据库对象删除成功\n")
 
 	// 删除相关的内存表
-	fmt.Printf("删除相关的内存表\n")
+	logger.Printf("删除相关的内存表\n")
 	prefix := dbName + ":"
 	for key := range e.memTables {
 		if strings.HasPrefix(key, prefix) {
 			delete(e.memTables, key)
 		}
 	}
-	fmt.Printf("内存表删除成功\n")
+	logger.Printf("内存表删除成功\n")
 
 	// 移除数据库相关的所有锁
 	e.lockManager.RemoveDatabaseLocks(dbName)
-	fmt.Printf("数据库相关的锁已移除\n")
+	logger.Printf("数据库相关的锁已移除\n")
 
 	// 保存更新后的元数据
-	fmt.Printf("保存更新后的元数据\n")
+	logger.Printf("保存更新后的元数据\n")
 	if err := e.saveMetadata(true); err != nil {
-		fmt.Printf("保存元数据失败: %v\n", err)
+		logger.Printf("保存元数据失败: %v\n", err)
 		return fmt.Errorf("failed to save metadata: %w", err)
 	}
-	fmt.Printf("元数据保存成功\n")
+	logger.Printf("元数据保存成功\n")
 
-	fmt.Printf("数据库 %s 删除成功\n", dbName)
+	logger.Printf("数据库 %s 删除成功\n", dbName)
 	return nil
 }
 
 // DropTable 删除表
 func (e *StorageEngine) DropTable(dbName, tableName string) error {
-	fmt.Printf("开始删除表: %s.%s\n", dbName, tableName)
+	logger.Printf("开始删除表: %s.%s\n", dbName, tableName)
 
 	// 获取数据库写锁
 	unlock := e.lockManager.LockDatabase(dbName, true)
 	defer func() {
 		unlock()
-		fmt.Printf("DropTable: 解锁完成\n")
+		logger.Printf("DropTable: 解锁完成\n")
 	}()
 
 	// 检查数据库是否存在
 	db, exists := e.databases[dbName]
 	if !exists {
-		fmt.Printf("数据库 %s 不存在\n", dbName)
 		return fmt.Errorf("database %s does not exist", dbName)
 	}
 
 	// 检查表是否存在
 	if _, exists := db.Tables[tableName]; !exists {
-		fmt.Printf("表 %s 在数据库 %s 中不存在\n", tableName, dbName)
 		return fmt.Errorf("table %s does not exist in database %s", tableName, dbName)
 	}
-	fmt.Printf("表 %s.%s 存在，准备删除\n", dbName, tableName)
 
 	// 删除表目录
 	tablePath := filepath.Join(e.dataDir, dbName, tableName)
-	fmt.Printf("删除表目录: %s\n", tablePath)
 	if err := os.RemoveAll(tablePath); err != nil {
-		fmt.Printf("删除表目录失败: %v\n", err)
 		return fmt.Errorf("failed to remove table directory: %w", err)
 	}
-	fmt.Printf("表目录删除成功\n")
 
 	// 删除内存中的表对象
-	fmt.Printf("从内存中删除表对象\n")
 	delete(db.Tables, tableName)
-	fmt.Printf("内存中的表对象删除成功\n")
 
 	// 删除内存表
 	memTableKey := dbName + ":" + tableName
 	if _, exists := e.memTables[memTableKey]; exists {
-		fmt.Printf("删除内存表\n")
 		delete(e.memTables, memTableKey)
-		fmt.Printf("内存表删除成功\n")
 	}
 
 	// 移除表锁
 	e.lockManager.RemoveTableLock(dbName, tableName)
-	fmt.Printf("表锁已移除\n")
 
 	// 保存更新后的元数据
-	fmt.Printf("保存更新后的元数据\n")
 	if err := e.saveMetadata(true); err != nil {
-		fmt.Printf("保存元数据失败: %v\n", err)
 		return fmt.Errorf("failed to save metadata: %w", err)
 	}
-	fmt.Printf("元数据保存成功\n")
 
-	fmt.Printf("表 %s.%s 删除成功\n", dbName, tableName)
 	return nil
 }
 
@@ -1561,7 +1546,7 @@ func (e *StorageEngine) enforceRetentionPolicies() {
 		for tableName := range db.Tables {
 			go func(dbName, tableName string, retentionTimestamp int64) {
 				if err := e.purgeExpiredData(dbName, tableName, retentionTimestamp); err != nil {
-					fmt.Printf("Error purging expired data for %s.%s: %v\n", dbName, tableName, err)
+					logger.Printf("Error purging expired data for %s.%s: %v\n", dbName, tableName, err)
 				}
 			}(dbName, tableName, retentionTimestamp)
 		}
@@ -1634,7 +1619,7 @@ func (e *StorageEngine) performDownsampling() {
 					startTime := endTime.Add(-policy.Interval * 10) // 处理10个降采样间隔的数据
 
 					if err := e.downsampleData(dbName, tableName, table, policy, startTime, endTime); err != nil {
-						fmt.Printf("Error downsampling data for %s.%s: %v\n", dbName, tableName, err)
+						logger.Printf("Error downsampling data for %s.%s: %v\n", dbName, tableName, err)
 					}
 				}
 			}(dbName, tableName, table, db.RetentionPolicy.Downsample)
@@ -1833,7 +1818,7 @@ func (e *StorageEngine) migrateDataBetweenTiers() {
 		for tableName := range db.Tables {
 			go func(dbName, tableName string) {
 				if err := e.migrateDatabaseTableData(dbName, tableName, now); err != nil {
-					fmt.Printf("Error migrating data for %s.%s: %v\n", dbName, tableName, err)
+					logger.Printf("Error migrating data for %s.%s: %v\n", dbName, tableName, err)
 				}
 			}(dbName, tableName)
 		}
@@ -2196,7 +2181,7 @@ func getDirSize(path string) (int64, error) {
 
 // ClearTable 清空表中的所有数据
 func (e *StorageEngine) ClearTable(dbName, tableName string) error {
-	fmt.Printf("开始清空表: %s.%s\n", dbName, tableName)
+	logger.Printf("开始清空表: %s.%s\n", dbName, tableName)
 
 	// 第一阶段：获取数据库锁和表锁，检查数据库和表是否存在
 	unlock := e.lockManager.LockMulti(false, map[string]bool{dbName: true}, map[string]bool{dbName + ":" + tableName: true})
@@ -2205,7 +2190,7 @@ func (e *StorageEngine) ClearTable(dbName, tableName string) error {
 	db, exists := e.databases[dbName]
 	if !exists {
 		unlock()
-		fmt.Printf("数据库 %s 不存在\n", dbName)
+		logger.Printf("数据库 %s 不存在\n", dbName)
 		return fmt.Errorf("database %s does not exist", dbName)
 	}
 
@@ -2213,41 +2198,41 @@ func (e *StorageEngine) ClearTable(dbName, tableName string) error {
 	table, exists := db.Tables[tableName]
 	if !exists {
 		unlock()
-		fmt.Printf("表 %s 在数据库 %s 中不存在\n", tableName, dbName)
+		logger.Printf("表 %s 在数据库 %s 中不存在\n", tableName, dbName)
 		return fmt.Errorf("table %s does not exist in database %s", tableName, dbName)
 	}
-	fmt.Printf("表 %s.%s 存在，准备清空\n", dbName, tableName)
+	logger.Printf("表 %s.%s 存在，准备清空\n", dbName, tableName)
 
 	// 获取表的数据目录
 	tableDir := filepath.Join(e.dataDir, dbName, tableName)
-	fmt.Printf("表数据目录: %s\n", tableDir)
+	logger.Printf("表数据目录: %s\n", tableDir)
 
 	// 获取表中的数据文件
 	dataFiles, err := filepath.Glob(filepath.Join(tableDir, "*.data"))
 	if err != nil {
 		unlock()
-		fmt.Printf("获取数据文件失败: %v\n", err)
+		logger.Printf("获取数据文件失败: %v\n", err)
 		return fmt.Errorf("failed to get data files: %w", err)
 	}
-	fmt.Printf("找到 %d 个数据文件\n", len(dataFiles))
+	logger.Printf("找到 %d 个数据文件\n", len(dataFiles))
 
 	// 删除所有数据文件
 	for _, file := range dataFiles {
-		fmt.Printf("删除数据文件: %s\n", file)
+		logger.Printf("删除数据文件: %s\n", file)
 		if err := os.Remove(file); err != nil {
 			unlock()
-			fmt.Printf("删除数据文件失败: %v\n", err)
+			logger.Printf("删除数据文件失败: %v\n", err)
 			return fmt.Errorf("failed to remove data file %s: %w", file, err)
 		}
 	}
-	fmt.Printf("所有数据文件删除成功\n")
+	logger.Printf("所有数据文件删除成功\n")
 
 	// 清空内存表
 	memTableKey := dbName + ":" + tableName
 	if memTable, exists := e.memTables[memTableKey]; exists {
-		fmt.Printf("清空内存表\n")
+		logger.Printf("清空内存表\n")
 		memTable.Clear()
-		fmt.Printf("内存表清空成功\n")
+		logger.Printf("内存表清空成功\n")
 	}
 
 	// 保存需要重建的索引
@@ -2259,21 +2244,21 @@ func (e *StorageEngine) ClearTable(dbName, tableName string) error {
 
 	// 释放锁
 	unlock()
-	fmt.Printf("ClearTable: 第一阶段完成，释放锁\n")
+	logger.Printf("ClearTable: 第一阶段完成，释放锁\n")
 
 	// 第二阶段：重建索引（不需要锁）
 	if len(tagIndexes) > 0 {
-		fmt.Printf("重建索引\n")
+		logger.Printf("重建索引\n")
 		for _, tagIndex := range tagIndexes {
-			fmt.Printf("重建索引: %s\n", tagIndex.Name)
+			logger.Printf("重建索引: %s\n", tagIndex.Name)
 			if err := e.RebuildIndex(dbName, tableName, tagIndex.Name); err != nil {
-				fmt.Printf("重建索引失败: %v\n", err)
+				logger.Printf("重建索引失败: %v\n", err)
 				return fmt.Errorf("failed to rebuild index %s: %w", tagIndex.Name, err)
 			}
 		}
-		fmt.Printf("所有索引重建成功\n")
+		logger.Printf("所有索引重建成功\n")
 	}
 
-	fmt.Printf("表 %s.%s 清空成功\n", dbName, tableName)
+	logger.Printf("表 %s.%s 清空成功\n", dbName, tableName)
 	return nil
 }

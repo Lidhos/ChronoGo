@@ -1,7 +1,6 @@
 package storage
 
 import (
-	"fmt"
 	"strings"
 	"sync"
 
@@ -61,12 +60,12 @@ func (lm *LockManager) GetTableLock(dbName, tableName string) *sync.RWMutex {
 func (lm *LockManager) LockGlobal(write bool) func() {
 	if write {
 		if lm.debug {
-			fmt.Println("获取全局写锁")
+			logger.Println("获取全局写锁")
 		}
 		lm.globalLock.Lock()
 		return func() {
 			if lm.debug {
-				fmt.Println("释放全局写锁")
+				logger.Println("释放全局写锁")
 			}
 			lm.globalLock.Unlock()
 		}
