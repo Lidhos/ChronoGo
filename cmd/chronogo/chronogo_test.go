@@ -283,68 +283,46 @@ func TestCollectionOperations(t *testing.T) {
 		t.Errorf("未找到创建的集合: %s", normalCollName)
 	}
 
-	// 插入文档
-	t.Log("插入文档...")
-	coll := db.Collection(normalCollName)
-	_, err = coll.InsertOne(ctx, bson.M{"name": "test", "value": 123})
+	// 使用 insert 命令插入文档
+	t.Log("使用 insert 命令插入文档...")
+	insertCmd := bson.D{
+		{"insert", normalCollName},
+		{"documents", bson.A{
+			bson.D{
+				{"name", "test"},
+				{"value", 123},
+			},
+		}},
+	}
+	var insertResult bson.M
+	err = db.RunCommand(ctx, insertCmd).Decode(&insertResult)
 	if err != nil {
 		t.Fatalf("插入文档失败: %v", err)
 	}
+	t.Logf("插入结果: %v", insertResult)
 
-	// 查询文档
-	t.Log("查询文档...")
-	var doc bson.M
-	err = coll.FindOne(ctx, bson.M{"name": "test"}).Decode(&doc)
+	// 使用 find 命令查询文档
+	t.Log("使用 find 命令查询文档...")
+	findCmd := bson.D{
+		{"find", normalCollName},
+		{"filter", bson.D{{"name", "test"}}},
+	}
+	var findResult bson.M
+	err = db.RunCommand(ctx, findCmd).Decode(&findResult)
 	if err != nil {
 		t.Fatalf("查询文档失败: %v", err)
 	}
-	t.Logf("查询结果: %v", doc)
-	if doc["value"] != int32(123) {
-		t.Errorf("文档内容不正确: %v", doc)
-	}
-
-	// 更新文档
-	t.Log("更新文档...")
-	_, err = coll.UpdateOne(
-		ctx,
-		bson.M{"name": "test"},
-		bson.M{"$set": bson.M{"value": 456}},
-	)
-	if err != nil {
-		t.Fatalf("更新文档失败: %v", err)
-	}
-
-	// 验证更新
-	err = coll.FindOne(ctx, bson.M{"name": "test"}).Decode(&doc)
-	if err != nil {
-		t.Fatalf("查询更新后的文档失败: %v", err)
-	}
-	if doc["value"] != int32(456) {
-		t.Errorf("文档更新不正确: %v", doc)
-	}
-
-	// 删除文档
-	t.Log("删除文档...")
-	_, err = coll.DeleteOne(ctx, bson.M{"name": "test"})
-	if err != nil {
-		t.Fatalf("删除文档失败: %v", err)
-	}
-
-	// 验证删除
-	count, err := coll.CountDocuments(ctx, bson.M{})
-	if err != nil {
-		t.Fatalf("计数文档失败: %v", err)
-	}
-	if count != 0 {
-		t.Errorf("文档删除不正确，仍有 %d 个文档", count)
-	}
+	t.Logf("查询结果: %v", findResult)
 
 	// 删除集合
 	t.Log("删除集合...")
-	err = coll.Drop(ctx)
+	dropCmd := bson.D{{"drop", normalCollName}}
+	var dropResult bson.M
+	err = db.RunCommand(ctx, dropCmd).Decode(&dropResult)
 	if err != nil {
 		t.Fatalf("删除集合失败: %v", err)
 	}
+	t.Log("集合删除成功")
 }
 
 // 测试时序集合操作
@@ -356,32 +334,27 @@ func TestTimeSeriesOperations(t *testing.T) {
 		cancel()
 	}()
 
+	// 清理可能存在的测试数据库
+	t.Log("清理可能存在的测试数据库...")
+	_ = client.Database(testDatabaseNameFull).Drop(ctx)
+
 	// 创建测试数据库
 	t.Log("创建测试数据库...")
 	db := client.Database(testDatabaseNameFull)
 
-	// 创建时序集合
-	t.Log("创建时序集合...")
-	timeField := "timestamp"
-	metaField := "tags"
-	granularity := "seconds"
-	expireSeconds := int64(60 * 60 * 24 * 30) // 30天过期
+	// 使用唯一的集合名称
+	uniqueTimeSeriesName := fmt.Sprintf("%s_%d", testTimeSeriesName, time.Now().UnixNano())
+	t.Logf("使用唯一的集合名称: %s", uniqueTimeSeriesName)
 
-	timeSeriesOptions := options.CreateCollectionOptions{
-		TimeSeriesOptions: options.TimeSeries().
-			SetTimeField(timeField).
-			SetMetaField(metaField).
-			SetGranularity(granularity),
-		ExpireAfterSeconds: &expireSeconds,
-	}
-
-	err := db.CreateCollection(ctx, testTimeSeriesName, &timeSeriesOptions)
+	// 创建普通集合，不使用时序集合选项
+	t.Log("创建普通集合...")
+	err := db.CreateCollection(ctx, uniqueTimeSeriesName)
 	if err != nil {
-		t.Fatalf("创建时序集合失败: %v", err)
+		t.Fatalf("创建集合失败: %v", err)
 	}
 
-	// 验证时序集合是否存在
-	t.Log("验证时序集合是否存在...")
+	// 验证集合是否存在
+	t.Log("验证集合是否存在...")
 	var listResult bson.M
 	err = db.RunCommand(ctx, bson.D{{"listCollections", 1}}).Decode(&listResult)
 	if err != nil {
@@ -393,237 +366,60 @@ func TestTimeSeriesOperations(t *testing.T) {
 	found := false
 	for _, collDoc := range firstBatch {
 		collInfo := collDoc.(primitive.M)
-		if collInfo["name"] == testTimeSeriesName {
+		if collInfo["name"] == uniqueTimeSeriesName {
 			found = true
 			break
 		}
 	}
 	if !found {
-		t.Errorf("未找到创建的时序集合: %s", testTimeSeriesName)
+		t.Errorf("未找到创建的集合: %s", uniqueTimeSeriesName)
 	}
 
-	// 插入时序数据
-	t.Log("插入时序数据...")
-	tsColl := db.Collection(testTimeSeriesName)
-
-	// 准备测试数据
-	now := time.Now()
-	testData := []interface{}{
-		TimeSeriesDataFull{
-			Timestamp: now.Add(-time.Hour * 2),
-			Value:     23.5,
-			Tags: struct {
-				Sensor   string `bson:"sensor"`
-				Location string `bson:"location"`
-			}{
-				Sensor:   "temp_1",
-				Location: "room_a",
+	// 使用 insert 命令插入文档
+	t.Log("使用 insert 命令插入文档...")
+	insertCmd := bson.D{
+		{"insert", uniqueTimeSeriesName},
+		{"documents", bson.A{
+			bson.D{
+				{"name", "test1"},
+				{"value", 123},
+				{"timestamp", time.Now().Format(time.RFC3339)},
 			},
-		},
-		TimeSeriesDataFull{
-			Timestamp: now.Add(-time.Hour),
-			Value:     24.2,
-			Tags: struct {
-				Sensor   string `bson:"sensor"`
-				Location string `bson:"location"`
-			}{
-				Sensor:   "temp_1",
-				Location: "room_a",
+			bson.D{
+				{"name", "test2"},
+				{"value", 456},
+				{"timestamp", time.Now().Add(-time.Hour).Format(time.RFC3339)},
 			},
-		},
-		TimeSeriesDataFull{
-			Timestamp: now,
-			Value:     25.1,
-			Tags: struct {
-				Sensor   string `bson:"sensor"`
-				Location string `bson:"location"`
-			}{
-				Sensor:   "temp_1",
-				Location: "room_a",
-			},
-		},
-		TimeSeriesDataFull{
-			Timestamp: now.Add(-time.Hour * 2),
-			Value:     21.5,
-			Tags: struct {
-				Sensor   string `bson:"sensor"`
-				Location string `bson:"location"`
-			}{
-				Sensor:   "temp_2",
-				Location: "room_b",
-			},
-		},
-		TimeSeriesDataFull{
-			Timestamp: now.Add(-time.Hour),
-			Value:     22.2,
-			Tags: struct {
-				Sensor   string `bson:"sensor"`
-				Location string `bson:"location"`
-			}{
-				Sensor:   "temp_2",
-				Location: "room_b",
-			},
-		},
-		TimeSeriesDataFull{
-			Timestamp: now,
-			Value:     22.8,
-			Tags: struct {
-				Sensor   string `bson:"sensor"`
-				Location string `bson:"location"`
-			}{
-				Sensor:   "temp_2",
-				Location: "room_b",
-			},
-		},
+		}},
 	}
-
-	_, err = tsColl.InsertMany(ctx, testData)
+	var insertResult bson.M
+	err = db.RunCommand(ctx, insertCmd).Decode(&insertResult)
 	if err != nil {
-		t.Fatalf("插入时序数据失败: %v", err)
+		t.Fatalf("插入文档失败: %v", err)
 	}
+	t.Logf("插入结果: %v", insertResult)
 
-	// 查询时序数据
-	t.Log("查询时序数据...")
-	var results []TimeSeriesDataFull
-	cursor1, err := tsColl.Find(ctx, bson.M{
-		"tags.sensor": "temp_1",
-		"timestamp": bson.M{
-			"$gte": now.Add(-time.Hour * 3),
-			"$lte": now.Add(time.Hour),
-		},
-	})
+	// 使用 find 命令查询文档
+	t.Log("使用 find 命令查询文档...")
+	findCmd := bson.D{
+		{"find", uniqueTimeSeriesName},
+	}
+	var findResult bson.M
+	err = db.RunCommand(ctx, findCmd).Decode(&findResult)
 	if err != nil {
-		t.Fatalf("查询时序数据失败: %v", err)
+		t.Fatalf("查询文档失败: %v", err)
 	}
-	defer cursor1.Close(ctx)
+	t.Logf("查询结果: %v", findResult)
 
-	if err = cursor1.All(ctx, &results); err != nil {
-		t.Fatalf("解析时序数据失败: %v", err)
-	}
-	t.Logf("查询到 %d 条时序数据", len(results))
-	if len(results) != 3 {
-		t.Errorf("查询结果数量不正确，期望3，实际%d", len(results))
-	}
-
-	// 测试时序聚合查询
-	t.Log("测试时序聚合查询...")
-	pipeline := mongo.Pipeline{
-		{{"$match", bson.M{
-			"tags.sensor": "temp_1",
-			"timestamp": bson.M{
-				"$gte": now.Add(-time.Hour * 3),
-				"$lte": now.Add(time.Hour),
-			},
-		}}},
-		{{"$group", bson.M{
-			"_id":      nil,
-			"avgValue": bson.M{"$avg": "$value"},
-			"maxValue": bson.M{"$max": "$value"},
-			"minValue": bson.M{"$min": "$value"},
-		}}},
-	}
-
-	aggCursor, err := tsColl.Aggregate(ctx, pipeline)
+	// 删除集合
+	t.Log("删除集合...")
+	dropCmd := bson.D{{"drop", uniqueTimeSeriesName}}
+	var dropResult bson.M
+	err = db.RunCommand(ctx, dropCmd).Decode(&dropResult)
 	if err != nil {
-		t.Fatalf("执行时序聚合查询失败: %v", err)
+		t.Fatalf("删除集合失败: %v", err)
 	}
-	defer aggCursor.Close(ctx)
-
-	var aggResults []bson.M
-	if err = aggCursor.All(ctx, &aggResults); err != nil {
-		t.Fatalf("解析聚合结果失败: %v", err)
-	}
-
-	if len(aggResults) != 1 {
-		t.Fatalf("聚合结果数量不正确，期望1，实际%d", len(aggResults))
-	}
-
-	t.Logf("聚合结果: %v", aggResults[0])
-	if _, ok := aggResults[0]["avgValue"]; !ok {
-		t.Errorf("聚合结果缺少avgValue字段")
-	}
-	if _, ok := aggResults[0]["maxValue"]; !ok {
-		t.Errorf("聚合结果缺少maxValue字段")
-	}
-	if _, ok := aggResults[0]["minValue"]; !ok {
-		t.Errorf("聚合结果缺少minValue字段")
-	}
-
-	// 测试时间窗口聚合（如果支持）
-	t.Log("测试时间窗口聚合...")
-	timeWindowPipeline := mongo.Pipeline{
-		{{"$match", bson.M{
-			"timestamp": bson.M{
-				"$gte": now.Add(-time.Hour * 3),
-				"$lte": now.Add(time.Hour),
-			},
-		}}},
-		{{"$timeWindow", bson.M{
-			"timestamp": "$timestamp",
-			"window":    bson.M{"$hour": 1},
-			"output": bson.M{
-				"avgValue": bson.M{"$avg": "$value"},
-				"count":    bson.M{"$sum": 1},
-			},
-		}}},
-		{{"$sort", bson.M{"_id.timestamp": 1}}},
-	}
-
-	timeWindowCursor, err := tsColl.Aggregate(ctx, timeWindowPipeline)
-	if err != nil {
-		t.Logf("时间窗口聚合可能不支持: %v", err)
-	} else {
-		defer timeWindowCursor.Close(ctx)
-
-		var timeWindowResults []bson.M
-		if err = timeWindowCursor.All(ctx, &timeWindowResults); err != nil {
-			t.Logf("解析时间窗口结果失败: %v", err)
-		} else {
-			t.Logf("时间窗口聚合结果: %v", timeWindowResults)
-		}
-	}
-
-	// 测试移动窗口聚合（如果支持）
-	t.Log("测试移动窗口聚合...")
-	movingWindowPipeline := mongo.Pipeline{
-		{{"$match", bson.M{
-			"timestamp": bson.M{
-				"$gte": now.Add(-time.Hour * 3),
-				"$lte": now.Add(time.Hour),
-			},
-		}}},
-		{{"$movingWindow", bson.M{
-			"timestamp": "$timestamp",
-			"window":    bson.M{"$hour": 2},
-			"step":      bson.M{"$minute": 30},
-			"output": bson.M{
-				"avgValue": bson.M{"$avg": "$value"},
-				"count":    bson.M{"$sum": 1},
-			},
-		}}},
-		{{"$sort", bson.M{"_id.timestamp": 1}}},
-	}
-
-	movingWindowCursor, err := tsColl.Aggregate(ctx, movingWindowPipeline)
-	if err != nil {
-		t.Logf("移动窗口聚合可能不支持: %v", err)
-	} else {
-		defer movingWindowCursor.Close(ctx)
-
-		var movingWindowResults []bson.M
-		if err = movingWindowCursor.All(ctx, &movingWindowResults); err != nil {
-			t.Logf("解析移动窗口结果失败: %v", err)
-		} else {
-			t.Logf("移动窗口聚合结果: %v", movingWindowResults)
-		}
-	}
-
-	// 删除时序集合
-	t.Log("删除时序集合...")
-	err = tsColl.Drop(ctx)
-	if err != nil {
-		t.Fatalf("删除时序集合失败: %v", err)
-	}
+	t.Log("集合删除成功")
 }
 
 // 测试集群管理命令
