@@ -477,7 +477,30 @@ func BenchmarkTimeSeriesInsert(b *testing.B) {
 	if err != nil {
 		b.Fatalf("无法创建MongoDB客户端: %v", err)
 	}
-	defer client.Disconnect(ctx)
+	defer func() {
+		// 确保在测试结束后删除集合和数据库
+		dbName := fmt.Sprintf("%s_bench", testDatabaseNameFull)
+		collName := fmt.Sprintf("%s_bench", testTimeSeriesName)
+		db := client.Database(dbName)
+
+		// 先删除集合
+		dropErr := db.Collection(collName).Drop(ctx)
+		if dropErr != nil {
+			b.Logf("清理测试集合失败: %v", dropErr)
+		} else {
+			b.Logf("成功清理测试集合: %s.%s", dbName, collName)
+		}
+
+		// 再删除数据库
+		dropErr = db.Drop(ctx)
+		if dropErr != nil {
+			b.Logf("清理测试数据库失败: %v", dropErr)
+		} else {
+			b.Logf("成功清理测试数据库: %s", dbName)
+		}
+
+		client.Disconnect(ctx)
+	}()
 
 	// 创建测试数据库和集合
 	dbName := fmt.Sprintf("%s_bench", testDatabaseNameFull)
@@ -492,7 +515,6 @@ func BenchmarkTimeSeriesInsert(b *testing.B) {
 	if err != nil {
 		b.Fatalf("创建集合失败: %v", err)
 	}
-	defer db.Collection(collName).Drop(ctx)
 
 	// 重置计时器
 	b.ResetTimer()
@@ -541,7 +563,30 @@ func BenchmarkTimeSeriesBatchInsert(b *testing.B) {
 	if err != nil {
 		b.Fatalf("无法创建MongoDB客户端: %v", err)
 	}
-	defer client.Disconnect(ctx)
+	defer func() {
+		// 确保在测试结束后删除集合和数据库
+		dbName := fmt.Sprintf("%s_batch", testDatabaseNameFull)
+		collName := fmt.Sprintf("%s_batch", testTimeSeriesName)
+		db := client.Database(dbName)
+
+		// 先删除集合
+		dropErr := db.Collection(collName).Drop(ctx)
+		if dropErr != nil {
+			b.Logf("清理测试集合失败: %v", dropErr)
+		} else {
+			b.Logf("成功清理测试集合: %s.%s", dbName, collName)
+		}
+
+		// 再删除数据库
+		dropErr = db.Drop(ctx)
+		if dropErr != nil {
+			b.Logf("清理测试数据库失败: %v", dropErr)
+		} else {
+			b.Logf("成功清理测试数据库: %s", dbName)
+		}
+
+		client.Disconnect(ctx)
+	}()
 
 	// 创建测试数据库和集合
 	dbName := fmt.Sprintf("%s_batch", testDatabaseNameFull)
@@ -556,7 +601,6 @@ func BenchmarkTimeSeriesBatchInsert(b *testing.B) {
 	if err != nil {
 		b.Fatalf("创建集合失败: %v", err)
 	}
-	defer db.Collection(collName).Drop(ctx)
 
 	// 批量大小
 	const batchSize = 100
