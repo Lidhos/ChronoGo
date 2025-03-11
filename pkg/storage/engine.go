@@ -32,6 +32,8 @@ type StorageEngine struct {
 	databases    map[string]*model.Database // 数据库映射
 	memTables    map[string]*MemTable       // 内存表映射 (db:table -> memtable)
 	wal          *WAL                       // 预写日志
+	asyncWAL     *AsyncWAL                  // 异步预写日志
+	writeBuffer  *WriteBuffer               // 写缓冲区
 	indexMgr     index.IndexManager         // 索引管理器
 	flushTicker  *time.Ticker               // 刷盘定时器
 	storageTiers []model.StorageTier        // 存储层级
@@ -90,6 +92,11 @@ func NewStorageEngine(baseDir string) (*StorageEngine, error) {
 	}
 	engine.wal = wal
 
+	// 创建异步WAL
+	// 参数: WAL, 队列大小, 批处理大小, 刷新间隔, 工作线程数
+	asyncWAL := NewAsyncWAL(wal, 10000, 100, 100*time.Millisecond, 2)
+	engine.asyncWAL = asyncWAL
+
 	// 加载元数据
 	if err := engine.loadMetadata(); err != nil {
 		return nil, fmt.Errorf("failed to load metadata: %w", err)
@@ -99,6 +106,11 @@ func NewStorageEngine(baseDir string) (*StorageEngine, error) {
 	if err := engine.recoverFromWAL(); err != nil {
 		return nil, fmt.Errorf("failed to recover from WAL: %w", err)
 	}
+
+	// 创建写缓冲区
+	// 参数: 存储引擎, 批处理大小, 刷新间隔
+	writeBuffer := NewWriteBuffer(engine, 100, 100*time.Millisecond)
+	engine.writeBuffer = writeBuffer
 
 	// 启动后台任务
 	engine.startBackgroundTasks()
@@ -710,6 +722,17 @@ func (e *StorageEngine) CreateTable(dbName, tableName string, schema model.Schem
 
 // InsertPoint 插入时序数据点
 func (e *StorageEngine) InsertPoint(dbName, tableName string, point *model.TimeSeriesPoint) error {
+	// 使用写缓冲区
+	if e.writeBuffer != nil {
+		return e.writeBuffer.Add(dbName, tableName, point)
+	}
+
+	// 如果写缓冲区不可用，则使用同步方式插入
+	return e.InsertPointSync(dbName, tableName, point)
+}
+
+// InsertPointSync 同步插入时序数据点
+func (e *StorageEngine) InsertPointSync(dbName, tableName string, point *model.TimeSeriesPoint) error {
 	// 获取表写锁
 	unlock := e.lockManager.LockTable(dbName, tableName, true)
 	defer unlock()
@@ -732,9 +755,16 @@ func (e *StorageEngine) InsertPoint(dbName, tableName string, point *model.TimeS
 		return fmt.Errorf("failed to create WAL entry: %w", err)
 	}
 
-	// 写入WAL
-	if err := e.wal.Write(entry); err != nil {
-		return fmt.Errorf("failed to write to WAL: %w", err)
+	// 使用异步WAL
+	if e.asyncWAL != nil {
+		if err := e.asyncWAL.Write(entry); err != nil {
+			return fmt.Errorf("failed to write to async WAL: %w", err)
+		}
+	} else {
+		// 如果异步WAL不可用，则使用同步WAL
+		if err := e.wal.Write(entry); err != nil {
+			return fmt.Errorf("failed to write to WAL: %w", err)
+		}
 	}
 
 	// 获取内存表
@@ -977,8 +1007,22 @@ func (e *StorageEngine) Close() error {
 		return fmt.Errorf("failed to save metadata: %w", err)
 	}
 
+	// 关闭写缓冲区
+	if e.writeBuffer != nil {
+		if err := e.writeBuffer.Close(); err != nil {
+			return fmt.Errorf("failed to close write buffer: %w", err)
+		}
+	}
+
 	// 刷新所有内存表
 	e.flushMemTables()
+
+	// 关闭异步WAL
+	if e.asyncWAL != nil {
+		if err := e.asyncWAL.Close(); err != nil {
+			return fmt.Errorf("failed to close async WAL: %w", err)
+		}
+	}
 
 	// 关闭WAL
 	if err := e.wal.Close(); err != nil {
@@ -2269,6 +2313,27 @@ func (e *StorageEngine) InsertPoints(dbName, tableName string, points []*model.T
 		return nil
 	}
 
+	// 使用写缓冲区
+	if e.writeBuffer != nil {
+		// 批量添加到写缓冲区
+		for _, point := range points {
+			if err := e.writeBuffer.Add(dbName, tableName, point); err != nil {
+				return fmt.Errorf("failed to add point to write buffer: %w", err)
+			}
+		}
+		return nil
+	}
+
+	// 如果写缓冲区不可用，则使用同步方式插入
+	return e.InsertPointsSync(dbName, tableName, points)
+}
+
+// InsertPointsSync 同步批量插入时序数据点
+func (e *StorageEngine) InsertPointsSync(dbName, tableName string, points []*model.TimeSeriesPoint) error {
+	if len(points) == 0 {
+		return nil
+	}
+
 	// 获取表写锁
 	unlock := e.lockManager.LockTable(dbName, tableName, true)
 	defer unlock()
@@ -2299,9 +2364,16 @@ func (e *StorageEngine) InsertPoints(dbName, tableName string, points []*model.T
 			return fmt.Errorf("failed to create WAL entry: %w", err)
 		}
 
-		// 写入WAL
-		if err := e.wal.Write(entry); err != nil {
-			return fmt.Errorf("failed to write to WAL: %w", err)
+		// 使用异步WAL
+		if e.asyncWAL != nil {
+			if err := e.asyncWAL.Write(entry); err != nil {
+				return fmt.Errorf("failed to write to async WAL: %w", err)
+			}
+		} else {
+			// 如果异步WAL不可用，则使用同步WAL
+			if err := e.wal.Write(entry); err != nil {
+				return fmt.Errorf("failed to write to WAL: %w", err)
+			}
 		}
 
 		// 插入数据点
