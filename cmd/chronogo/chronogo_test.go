@@ -480,31 +480,19 @@ func BenchmarkTimeSeriesInsert(b *testing.B) {
 	defer client.Disconnect(ctx)
 
 	// 创建测试数据库和集合
-	db := client.Database(fmt.Sprintf("%s_bench", testDatabaseNameFull))
+	dbName := fmt.Sprintf("%s_bench", testDatabaseNameFull)
 	collName := fmt.Sprintf("%s_bench", testTimeSeriesName)
-
-	// 确保集合存在
-	timeField := "timestamp"
-	metaField := "tags"
-	granularity := "seconds"
-
-	timeSeriesOptions := options.CreateCollectionOptions{
-		TimeSeriesOptions: options.TimeSeries().
-			SetTimeField(timeField).
-			SetMetaField(metaField).
-			SetGranularity(granularity),
-	}
+	db := client.Database(dbName)
 
 	// 删除可能存在的集合
 	db.Collection(collName).Drop(ctx)
 
-	err = db.CreateCollection(ctx, collName, &timeSeriesOptions)
+	// 创建普通集合，不使用时序集合选项
+	err = db.CreateCollection(ctx, collName)
 	if err != nil {
-		b.Fatalf("创建时序集合失败: %v", err)
+		b.Fatalf("创建集合失败: %v", err)
 	}
 	defer db.Collection(collName).Drop(ctx)
-
-	coll := db.Collection(collName)
 
 	// 重置计时器
 	b.ResetTimer()
@@ -513,19 +501,24 @@ func BenchmarkTimeSeriesInsert(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		// 准备测试数据
 		now := time.Now()
-		data := TimeSeriesDataFull{
-			Timestamp: now.Add(time.Duration(i) * time.Second),
-			Value:     float64(20 + i%10),
-			Tags: struct {
-				Sensor   string `bson:"sensor"`
-				Location string `bson:"location"`
-			}{
-				Sensor:   fmt.Sprintf("sensor_%d", i%5),
-				Location: fmt.Sprintf("location_%d", i%3),
-			},
+
+		// 使用 insert 命令插入文档
+		insertCmd := bson.D{
+			{"insert", collName},
+			{"documents", bson.A{
+				bson.D{
+					{"timestamp", now.Format(time.RFC3339)},
+					{"value", float64(20 + i%10)},
+					{"tags", bson.D{
+						{"sensor", fmt.Sprintf("sensor_%d", i%5)},
+						{"location", fmt.Sprintf("location_%d", i%3)},
+					}},
+				},
+			}},
 		}
 
-		_, err := coll.InsertOne(ctx, data)
+		var insertResult bson.M
+		err = db.RunCommand(ctx, insertCmd).Decode(&insertResult)
 		if err != nil {
 			b.Fatalf("插入时序数据失败: %v", err)
 		}
