@@ -12,14 +12,14 @@ import (
 // AsyncWAL 表示异步预写日志
 type AsyncWAL struct {
 	wal           *WAL               // 底层WAL
-	entryChan     chan WALEntry      // 条目通道
+	entryChan     chan *WALEntry     // 条目通道
 	batchSize     int                // 批处理大小
 	flushInterval time.Duration      // 刷新间隔
 	wg            sync.WaitGroup     // 等待组
 	ctx           context.Context    // 上下文
 	cancel        context.CancelFunc // 取消函数
 	mu            sync.Mutex         // 互斥锁
-	buffer        []WALEntry         // 条目缓冲区
+	buffer        []*WALEntry        // 条目缓冲区
 }
 
 // NewAsyncWAL 创建新的异步WAL
@@ -28,12 +28,12 @@ func NewAsyncWAL(wal *WAL, queueSize int, batchSize int, flushInterval time.Dura
 
 	asyncWAL := &AsyncWAL{
 		wal:           wal,
-		entryChan:     make(chan WALEntry, queueSize),
+		entryChan:     make(chan *WALEntry, queueSize),
 		batchSize:     batchSize,
 		flushInterval: flushInterval,
 		ctx:           ctx,
 		cancel:        cancel,
-		buffer:        make([]WALEntry, 0, batchSize),
+		buffer:        make([]*WALEntry, 0, batchSize),
 	}
 
 	// 启动工作线程
@@ -50,7 +50,7 @@ func NewAsyncWAL(wal *WAL, queueSize int, batchSize int, flushInterval time.Dura
 }
 
 // Write 异步写入WAL条目
-func (aw *AsyncWAL) Write(entry WALEntry) error {
+func (aw *AsyncWAL) Write(entry *WALEntry) error {
 	select {
 	case aw.entryChan <- entry:
 		return nil
@@ -127,6 +127,9 @@ func (aw *AsyncWAL) flushBuffer() error {
 		if err := aw.wal.Write(entry); err != nil {
 			return fmt.Errorf("failed to write entry to WAL: %w", err)
 		}
+
+		// 将条目放回对象池
+		walEntryPool.Put(entry)
 	}
 
 	// 清空缓冲区
@@ -170,7 +173,7 @@ func (aw *AsyncWAL) Close() error {
 }
 
 // Recover 从WAL恢复
-func (aw *AsyncWAL) Recover() ([]WALEntry, error) {
+func (aw *AsyncWAL) Recover() ([]*WALEntry, error) {
 	// 直接使用底层WAL的恢复功能
 	return aw.wal.Recover()
 }

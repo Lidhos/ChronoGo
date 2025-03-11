@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -43,6 +44,9 @@ type WAL struct {
 	syncInterval time.Duration // 同步间隔
 	lastSync     time.Time     // 上次同步时间
 }
+
+// 全局WALEntry对象池
+var walEntryPool = NewWALEntryPool()
 
 // NewWAL 创建新的WAL
 func NewWAL(dir string, maxFileSize int64) (*WAL, error) {
@@ -107,55 +111,57 @@ func (w *WAL) openCurrentFile() error {
 }
 
 // Write 写入WAL条目
-func (w *WAL) Write(entry WALEntry) error {
+func (w *WAL) Write(entry *WALEntry) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-
-	// 检查是否需要创建新文件
-	if w.fileSize >= w.maxFileSize {
-		if err := w.rotateFile(); err != nil {
-			return err
-		}
-	}
 
 	// 序列化条目
 	data, err := w.serializeEntry(entry)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to serialize entry: %w", err)
 	}
 
-	// 写入文件
+	// 写入数据
 	n, err := w.currentFile.Write(data)
 	if err != nil {
-		return fmt.Errorf("failed to write WAL entry: %w", err)
+		return fmt.Errorf("failed to write to WAL file: %w", err)
 	}
 
+	// 更新文件大小
 	w.fileSize += int64(n)
 
 	// 检查是否需要同步
-	if time.Since(w.lastSync) > w.syncInterval {
+	if time.Since(w.lastSync) >= w.syncInterval {
 		if err := w.currentFile.Sync(); err != nil {
 			return fmt.Errorf("failed to sync WAL file: %w", err)
 		}
 		w.lastSync = time.Now()
 	}
 
+	// 检查是否需要轮换文件
+	if w.fileSize >= w.maxFileSize {
+		if err := w.rotateFile(); err != nil {
+			return fmt.Errorf("failed to rotate WAL file: %w", err)
+		}
+	}
+
 	return nil
 }
 
 // serializeEntry 序列化WAL条目
-func (w *WAL) serializeEntry(entry WALEntry) ([]byte, error) {
-	// 计算总长度
+func (w *WAL) serializeEntry(entry *WALEntry) ([]byte, error) {
+	// 计算条目大小
 	dbLen := len(entry.Database)
 	tableLen := len(entry.Table)
 	dataLen := len(entry.Data)
 
-	// 头部 + 数据库名长度 + 表名长度 + 时间戳 + 数据长度 + 数据库名 + 表名 + 数据
+	// 总大小 = 类型(1) + 数据库名长度(4) + 表名长度(4) + 时间戳(8) + 数据长度(4) + 数据库名 + 表名 + 数据
 	totalLen := 1 + 4 + 4 + 8 + 4 + dbLen + tableLen + dataLen
 
+	// 创建缓冲区
 	buf := make([]byte, totalLen)
 
-	// 写入操作类型
+	// 写入类型
 	buf[0] = entry.Type
 
 	// 写入数据库名长度
@@ -235,17 +241,9 @@ func (w *WAL) Close() error {
 }
 
 // Recover 从WAL恢复数据
-func (w *WAL) Recover() ([]WALEntry, error) {
+func (w *WAL) Recover() ([]*WALEntry, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-
-	// 关闭当前文件
-	if w.currentFile != nil {
-		if err := w.currentFile.Close(); err != nil {
-			return nil, fmt.Errorf("failed to close current WAL file: %w", err)
-		}
-		w.currentFile = nil
-	}
 
 	// 获取所有WAL文件
 	files, err := filepath.Glob(filepath.Join(w.dir, "*.wal"))
@@ -253,35 +251,33 @@ func (w *WAL) Recover() ([]WALEntry, error) {
 		return nil, fmt.Errorf("failed to list WAL files: %w", err)
 	}
 
-	var entries []WALEntry
+	// 按文件序号排序
+	sort.Strings(files)
 
-	// 按顺序处理每个文件
+	// 恢复所有文件
+	var allEntries []*WALEntry
 	for _, file := range files {
-		fileEntries, err := w.recoverFile(file)
+		entries, err := w.recoverFile(file)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to recover from file %s: %w", file, err)
 		}
-		entries = append(entries, fileEntries...)
+		allEntries = append(allEntries, entries...)
 	}
 
-	// 重新打开当前文件
-	if err := w.openCurrentFile(); err != nil {
-		return nil, err
-	}
-
-	return entries, nil
+	return allEntries, nil
 }
 
-// recoverFile 从单个WAL文件恢复数据
-func (w *WAL) recoverFile(filePath string) ([]WALEntry, error) {
+// recoverFile 从单个WAL文件恢复
+func (w *WAL) recoverFile(filePath string) ([]*WALEntry, error) {
+	// 打开文件
 	file, err := os.Open(filePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open WAL file: %w", err)
 	}
 	defer file.Close()
 
-	var entries []WALEntry
-
+	// 读取所有条目
+	var entries []*WALEntry
 	for {
 		entry, err := w.readEntry(file)
 		if err != nil {
@@ -297,88 +293,110 @@ func (w *WAL) recoverFile(filePath string) ([]WALEntry, error) {
 }
 
 // readEntry 从文件读取单个WAL条目
-func (w *WAL) readEntry(file *os.File) (WALEntry, error) {
-	var entry WALEntry
-
-	// 读取操作类型
+func (w *WAL) readEntry(file *os.File) (*WALEntry, error) {
+	// 读取类型
 	typeBuf := make([]byte, 1)
 	if _, err := io.ReadFull(file, typeBuf); err != nil {
-		return entry, err
+		return nil, err
 	}
-	entry.Type = typeBuf[0]
+	entryType := typeBuf[0]
 
 	// 读取数据库名长度
 	lenBuf := make([]byte, 4)
 	if _, err := io.ReadFull(file, lenBuf); err != nil {
-		return entry, err
+		return nil, err
 	}
 	dbLen := binary.LittleEndian.Uint32(lenBuf)
 
 	// 读取表名长度
 	if _, err := io.ReadFull(file, lenBuf); err != nil {
-		return entry, err
+		return nil, err
 	}
 	tableLen := binary.LittleEndian.Uint32(lenBuf)
 
 	// 读取时间戳
 	tsBuf := make([]byte, 8)
 	if _, err := io.ReadFull(file, tsBuf); err != nil {
-		return entry, err
+		return nil, err
 	}
-	entry.Timestamp = int64(binary.LittleEndian.Uint64(tsBuf))
+	timestamp := int64(binary.LittleEndian.Uint64(tsBuf))
 
 	// 读取数据长度
 	if _, err := io.ReadFull(file, lenBuf); err != nil {
-		return entry, err
+		return nil, err
 	}
 	dataLen := binary.LittleEndian.Uint32(lenBuf)
+
+	// 从对象池获取WALEntry
+	entry := walEntryPool.Get()
+	entry.Type = entryType
+	entry.Timestamp = timestamp
 
 	// 读取数据库名
 	dbBuf := make([]byte, dbLen)
 	if _, err := io.ReadFull(file, dbBuf); err != nil {
-		return entry, err
+		walEntryPool.Put(entry)
+		return nil, err
 	}
 	entry.Database = string(dbBuf)
 
 	// 读取表名
 	tableBuf := make([]byte, tableLen)
 	if _, err := io.ReadFull(file, tableBuf); err != nil {
-		return entry, err
+		walEntryPool.Put(entry)
+		return nil, err
 	}
 	entry.Table = string(tableBuf)
 
 	// 读取数据
-	dataBuf := make([]byte, dataLen)
-	if _, err := io.ReadFull(file, dataBuf); err != nil {
-		return entry, err
+	if dataLen > 0 {
+		// 确保Data切片有足够的容量
+		if cap(entry.Data) < int(dataLen) {
+			entry.Data = make([]byte, dataLen)
+		} else {
+			entry.Data = entry.Data[:dataLen]
+		}
+
+		if _, err := io.ReadFull(file, entry.Data); err != nil {
+			walEntryPool.Put(entry)
+			return nil, err
+		}
+	} else {
+		entry.Data = entry.Data[:0]
 	}
-	entry.Data = dataBuf
 
 	return entry, nil
 }
 
 // CreateInsertEntry 创建插入操作的WAL条目
-func CreateInsertEntry(db, table string, timestamp int64, doc bson.D) (WALEntry, error) {
+func CreateInsertEntry(db, table string, timestamp int64, doc bson.D) (*WALEntry, error) {
+	// 从对象池获取WALEntry
+	entry := walEntryPool.GetInsertEntry()
+	entry.Database = db
+	entry.Table = table
+	entry.Timestamp = timestamp
+
+	// 序列化BSON文档
 	data, err := bson.Marshal(doc)
 	if err != nil {
-		return WALEntry{}, fmt.Errorf("failed to marshal document: %w", err)
+		// 发生错误时，将对象放回池中
+		walEntryPool.Put(entry)
+		return nil, fmt.Errorf("failed to marshal BSON document: %w", err)
 	}
 
-	return WALEntry{
-		Type:      walOpInsert,
-		Database:  db,
-		Table:     table,
-		Timestamp: timestamp,
-		Data:      data,
-	}, nil
+	// 设置数据
+	entry.Data = append(entry.Data, data...)
+
+	return entry, nil
 }
 
 // CreateDeleteEntry 创建删除操作的WAL条目
-func CreateDeleteEntry(db, table string, timestamp int64) WALEntry {
-	return WALEntry{
-		Type:      walOpDelete,
-		Database:  db,
-		Table:     table,
-		Timestamp: timestamp,
-	}
+func CreateDeleteEntry(db, table string, timestamp int64) *WALEntry {
+	// 从对象池获取WALEntry
+	entry := walEntryPool.GetDeleteEntry()
+	entry.Database = db
+	entry.Table = table
+	entry.Timestamp = timestamp
+
+	return entry
 }

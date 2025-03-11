@@ -242,3 +242,260 @@ func (mt *MemTable) GetAll() []*model.TimeSeriesPoint {
 
 	return points
 }
+
+// Query 使用BSON过滤器查询数据点
+func (mt *MemTable) Query(filter bson.D) ([]*model.TimeSeriesPoint, error) {
+	mt.mu.RLock()
+	defer mt.mu.RUnlock()
+
+	// 获取所有数据点
+	allPoints := mt.GetAll()
+
+	// 如果没有过滤器，返回所有数据点
+	if len(filter) == 0 {
+		return allPoints, nil
+	}
+
+	// 应用过滤器
+	var result []*model.TimeSeriesPoint
+	for _, point := range allPoints {
+		// 检查是否匹配过滤器
+		if matchesFilter(point, filter) {
+			result = append(result, point)
+		}
+	}
+
+	return result, nil
+}
+
+// matchesFilter 检查数据点是否匹配BSON过滤器
+func matchesFilter(point *model.TimeSeriesPoint, filter bson.D) bool {
+	for _, elem := range filter {
+		switch elem.Key {
+		case "timestamp":
+			// 处理时间戳过滤
+			if !matchesTimestamp(point.Timestamp, elem.Value) {
+				return false
+			}
+		case "tags":
+			// 处理标签过滤
+			if !matchesTags(point.Tags, elem.Value) {
+				return false
+			}
+		default:
+			// 处理字段过滤
+			if !matchesField(point.Fields, elem.Key, elem.Value) {
+				return false
+			}
+		}
+	}
+
+	return true
+}
+
+// matchesTimestamp 检查时间戳是否匹配过滤条件
+func matchesTimestamp(timestamp int64, condition interface{}) bool {
+	// 处理简单相等
+	if ts, ok := condition.(int64); ok {
+		return timestamp == ts
+	}
+
+	// 处理复杂条件 (如 $gt, $lt 等)
+	if condMap, ok := condition.(bson.D); ok {
+		for _, cond := range condMap {
+			switch cond.Key {
+			case "$gt":
+				if val, ok := cond.Value.(int64); ok {
+					if !(timestamp > val) {
+						return false
+					}
+				}
+			case "$gte":
+				if val, ok := cond.Value.(int64); ok {
+					if !(timestamp >= val) {
+						return false
+					}
+				}
+			case "$lt":
+				if val, ok := cond.Value.(int64); ok {
+					if !(timestamp < val) {
+						return false
+					}
+				}
+			case "$lte":
+				if val, ok := cond.Value.(int64); ok {
+					if !(timestamp <= val) {
+						return false
+					}
+				}
+			case "$eq":
+				if val, ok := cond.Value.(int64); ok {
+					if !(timestamp == val) {
+						return false
+					}
+				}
+			case "$ne":
+				if val, ok := cond.Value.(int64); ok {
+					if !(timestamp != val) {
+						return false
+					}
+				}
+			}
+		}
+		return true
+	}
+
+	// 默认不匹配
+	return false
+}
+
+// matchesTags 检查标签是否匹配过滤条件
+func matchesTags(tags map[string]string, condition interface{}) bool {
+	// 处理标签条件
+	if tagCond, ok := condition.(bson.D); ok {
+		for _, cond := range tagCond {
+			tagValue, exists := tags[cond.Key]
+			if !exists {
+				return false
+			}
+
+			// 处理简单相等
+			if val, ok := cond.Value.(string); ok {
+				if tagValue != val {
+					return false
+				}
+			}
+		}
+		return true
+	}
+
+	// 默认不匹配
+	return false
+}
+
+// matchesField 检查字段是否匹配过滤条件
+func matchesField(fields map[string]interface{}, key string, condition interface{}) bool {
+	fieldValue, exists := fields[key]
+	if !exists {
+		return false
+	}
+
+	// 处理简单相等
+	if fieldValue == condition {
+		return true
+	}
+
+	// 处理复杂条件 (如 $gt, $lt 等)
+	if condMap, ok := condition.(bson.D); ok {
+		for _, cond := range condMap {
+			switch cond.Key {
+			case "$gt":
+				// 尝试数值比较
+				if !compareGreaterThan(fieldValue, cond.Value) {
+					return false
+				}
+			case "$gte":
+				// 尝试数值比较
+				if !compareGreaterThanOrEqual(fieldValue, cond.Value) {
+					return false
+				}
+			case "$lt":
+				// 尝试数值比较
+				if !compareLessThan(fieldValue, cond.Value) {
+					return false
+				}
+			case "$lte":
+				// 尝试数值比较
+				if !compareLessThanOrEqual(fieldValue, cond.Value) {
+					return false
+				}
+			case "$eq":
+				if fieldValue != cond.Value {
+					return false
+				}
+			case "$ne":
+				if fieldValue == cond.Value {
+					return false
+				}
+			}
+		}
+		return true
+	}
+
+	// 默认不匹配
+	return false
+}
+
+// compareGreaterThan 比较是否大于
+func compareGreaterThan(a, b interface{}) bool {
+	// 尝试转换为float64进行比较
+	aFloat, aOk := toFloat64(a)
+	bFloat, bOk := toFloat64(b)
+
+	if aOk && bOk {
+		return aFloat > bFloat
+	}
+
+	// 无法比较
+	return false
+}
+
+// compareGreaterThanOrEqual 比较是否大于等于
+func compareGreaterThanOrEqual(a, b interface{}) bool {
+	// 尝试转换为float64进行比较
+	aFloat, aOk := toFloat64(a)
+	bFloat, bOk := toFloat64(b)
+
+	if aOk && bOk {
+		return aFloat >= bFloat
+	}
+
+	// 无法比较
+	return false
+}
+
+// compareLessThan 比较是否小于
+func compareLessThan(a, b interface{}) bool {
+	// 尝试转换为float64进行比较
+	aFloat, aOk := toFloat64(a)
+	bFloat, bOk := toFloat64(b)
+
+	if aOk && bOk {
+		return aFloat < bFloat
+	}
+
+	// 无法比较
+	return false
+}
+
+// compareLessThanOrEqual 比较是否小于等于
+func compareLessThanOrEqual(a, b interface{}) bool {
+	// 尝试转换为float64进行比较
+	aFloat, aOk := toFloat64(a)
+	bFloat, bOk := toFloat64(b)
+
+	if aOk && bOk {
+		return aFloat <= bFloat
+	}
+
+	// 无法比较
+	return false
+}
+
+// toFloat64 尝试将值转换为float64
+func toFloat64(v interface{}) (float64, bool) {
+	switch val := v.(type) {
+	case int:
+		return float64(val), true
+	case int32:
+		return float64(val), true
+	case int64:
+		return float64(val), true
+	case float32:
+		return float64(val), true
+	case float64:
+		return val, true
+	default:
+		return 0, false
+	}
+}

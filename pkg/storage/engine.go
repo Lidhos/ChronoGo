@@ -41,6 +41,7 @@ type StorageEngine struct {
 	mu                sync.RWMutex               // 读写锁（旧的锁，将逐步替换）
 	lockManager       *LockManager               // 锁管理器
 	closing           chan struct{}              // 关闭信号
+	pointPool         *model.TimeSeriesPointPool // 数据点对象池
 }
 
 // QueryOptimizer 查询优化器
@@ -70,6 +71,13 @@ func NewStorageEngine(baseDir string) (*StorageEngine, error) {
 		}
 	}
 
+	// 创建数据点对象池并预热
+	pointPool := model.NewTimeSeriesPointPool()
+	pointPool.Prewarm(1000) // 预热1000个对象
+
+	// 预热WAL条目对象池
+	walEntryPool.Prewarm(1000) // 预热1000个对象
+
 	// 创建存储引擎
 	engine := &StorageEngine{
 		dataDir:     dataDir,
@@ -80,6 +88,7 @@ func NewStorageEngine(baseDir string) (*StorageEngine, error) {
 		memTables:   make(map[string]*MemTable),
 		lockManager: NewLockManager(true), // 启用调试日志
 		closing:     make(chan struct{}),
+		pointPool:   pointPool, // 使用预热后的对象池
 	}
 
 	// 创建索引管理器
@@ -849,7 +858,8 @@ func (e *StorageEngine) InsertPointSync(dbName, tableName string, point *model.T
 	return nil
 }
 
-// QueryByTimeRange 按时间范围查询
+// QueryByTimeRange 按时间范围查询时序数据点
+// 注意：调用者必须在使用完结果后调用ReleasePoints方法将对象放回池中，否则会导致内存泄漏
 func (e *StorageEngine) QueryByTimeRange(dbName, tableName string, start, end int64) ([]*model.TimeSeriesPoint, error) {
 	// 检查数据库和表是否存在
 	e.mu.RLock()
@@ -908,7 +918,8 @@ func (e *StorageEngine) QueryByTimeRange(dbName, tableName string, start, end in
 	return allPoints, nil
 }
 
-// QueryByTag 按标签查询
+// QueryByTag 按标签查询时序数据点
+// 注意：调用者必须在使用完结果后调用ReleasePoints方法将对象放回池中，否则会导致内存泄漏
 func (e *StorageEngine) QueryByTag(dbName, tableName, tagKey, tagValue string) ([]*model.TimeSeriesPoint, error) {
 	// 检查数据库和表是否存在
 	e.mu.RLock()
@@ -2474,4 +2485,68 @@ func (e *StorageEngine) InsertPointsSync(dbName, tableName string, points []*mod
 	}
 
 	return nil
+}
+
+// QueryPoints 查询时序数据点
+// 注意：调用者必须在使用完结果后调用ReleasePoints方法将对象放回池中，否则会导致内存泄漏
+// 例如：
+//
+//	points, err := engine.QueryPoints(...)
+//	if err != nil {
+//	  return err
+//	}
+//	defer engine.ReleasePoints(points)
+//	// 使用points...
+func (e *StorageEngine) QueryPoints(dbName, tableName string, filter bson.D, options bson.D) ([]*model.TimeSeriesPoint, error) {
+	// 获取表读锁
+	unlock := e.lockManager.LockTable(dbName, tableName, false)
+	defer unlock()
+
+	// 检查数据库和表是否存在
+	db, dbExists := e.databases[dbName]
+	if !dbExists {
+		return nil, fmt.Errorf("database %s does not exist", dbName)
+	}
+
+	_, tableExists := db.Tables[tableName]
+	if !tableExists {
+		return nil, fmt.Errorf("table %s does not exist in database %s", tableName, dbName)
+	}
+
+	// 获取内存表
+	memTable, err := e.getOrCreateMemTable(dbName, tableName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get memtable: %w", err)
+	}
+
+	// 查询内存表
+	points, err := memTable.Query(filter)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query memtable: %w", err)
+	}
+
+	return points, nil
+}
+
+// ReleasePoints 将数据点放回对象池
+func (e *StorageEngine) ReleasePoints(points []*model.TimeSeriesPoint) {
+	for _, point := range points {
+		e.pointPool.Put(point)
+	}
+}
+
+// SafeReleasePoints 安全地将数据点放回对象池，即使points为nil也不会panic
+func (e *StorageEngine) SafeReleasePoints(points []*model.TimeSeriesPoint) {
+	if points == nil {
+		return
+	}
+	e.ReleasePoints(points)
+}
+
+// GetPoolStats 获取对象池的统计信息
+func (e *StorageEngine) GetPoolStats() map[string]interface{} {
+	return map[string]interface{}{
+		"point_pool": e.pointPool.Stats(),
+		"wal_pool":   walEntryPool.Stats(),
+	}
 }

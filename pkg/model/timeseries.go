@@ -1,6 +1,7 @@
 package model
 
 import (
+	"fmt"
 	"sync"
 	"time"
 
@@ -84,6 +85,9 @@ type TimeSeriesOptions struct {
 	ExpirySeconds int64  // 过期时间
 }
 
+// 全局TimeSeriesPoint对象池
+var globalPointPool = NewTimeSeriesPointPool()
+
 // ToBSON 将TimeSeriesPoint转换为BSON文档
 func (p *TimeSeriesPoint) ToBSON() bson.D {
 	doc := bson.D{
@@ -107,29 +111,125 @@ func (p *TimeSeriesPoint) ToBSON() bson.D {
 	return doc
 }
 
-// FromBSON 从BSON文档创建TimeSeriesPoint
+// FromBSON 从BSON文档创建时序数据点
 func FromBSON(doc bson.D) (*TimeSeriesPoint, error) {
-	point := &TimeSeriesPoint{
-		Tags:   make(map[string]string),
-		Fields: make(map[string]interface{}),
-	}
+	// 从对象池获取一个TimeSeriesPoint
+	point := globalPointPool.Get()
 
+	// 解析BSON文档
 	for _, elem := range doc {
 		switch elem.Key {
 		case "timestamp":
-			if ts, ok := elem.Value.(int64); ok {
-				point.Timestamp = ts
+			// 处理时间戳
+			switch v := elem.Value.(type) {
+			case int64:
+				point.Timestamp = v
+			case int32:
+				point.Timestamp = int64(v)
+			case float64:
+				point.Timestamp = int64(v)
+			case time.Time:
+				point.Timestamp = v.UnixNano()
+			default:
+				// 发生错误时，将对象放回池中
+				globalPointPool.Put(point)
+				return nil, fmt.Errorf("unsupported timestamp type: %T", elem.Value)
 			}
 		case "tags":
+			// 处理标签
 			if tags, ok := elem.Value.(bson.D); ok {
 				for _, tag := range tags {
-					if strVal, ok := tag.Value.(string); ok {
-						point.Tags[tag.Key] = strVal
+					if strValue, ok := tag.Value.(string); ok {
+						point.Tags[tag.Key] = strValue
+					} else {
+						// 尝试转换为字符串
+						point.Tags[tag.Key] = fmt.Sprintf("%v", tag.Value)
+					}
+				}
+			} else if tags, ok := elem.Value.(map[string]interface{}); ok {
+				for k, v := range tags {
+					if strValue, ok := v.(string); ok {
+						point.Tags[k] = strValue
+					} else {
+						// 尝试转换为字符串
+						point.Tags[k] = fmt.Sprintf("%v", v)
+					}
+				}
+			} else if tags, ok := elem.Value.(bson.M); ok {
+				for k, v := range tags {
+					if strValue, ok := v.(string); ok {
+						point.Tags[k] = strValue
+					} else {
+						// 尝试转换为字符串
+						point.Tags[k] = fmt.Sprintf("%v", v)
 					}
 				}
 			}
 		default:
-			// 其他字段视为测量值
+			// 处理字段
+			point.Fields[elem.Key] = elem.Value
+		}
+	}
+
+	return point, nil
+}
+
+// FromBSONWithPool 从BSON文档创建时序数据点，使用指定的对象池
+func FromBSONWithPool(doc bson.D, pool *TimeSeriesPointPool) (*TimeSeriesPoint, error) {
+	// 从指定对象池获取一个TimeSeriesPoint
+	point := pool.Get()
+
+	// 解析BSON文档
+	for _, elem := range doc {
+		switch elem.Key {
+		case "timestamp":
+			// 处理时间戳
+			switch v := elem.Value.(type) {
+			case int64:
+				point.Timestamp = v
+			case int32:
+				point.Timestamp = int64(v)
+			case float64:
+				point.Timestamp = int64(v)
+			case time.Time:
+				point.Timestamp = v.UnixNano()
+			default:
+				// 发生错误时，将对象放回池中
+				pool.Put(point)
+				return nil, fmt.Errorf("unsupported timestamp type: %T", elem.Value)
+			}
+		case "tags":
+			// 处理标签
+			if tags, ok := elem.Value.(bson.D); ok {
+				for _, tag := range tags {
+					if strValue, ok := tag.Value.(string); ok {
+						point.Tags[tag.Key] = strValue
+					} else {
+						// 尝试转换为字符串
+						point.Tags[tag.Key] = fmt.Sprintf("%v", tag.Value)
+					}
+				}
+			} else if tags, ok := elem.Value.(map[string]interface{}); ok {
+				for k, v := range tags {
+					if strValue, ok := v.(string); ok {
+						point.Tags[k] = strValue
+					} else {
+						// 尝试转换为字符串
+						point.Tags[k] = fmt.Sprintf("%v", v)
+					}
+				}
+			} else if tags, ok := elem.Value.(bson.M); ok {
+				for k, v := range tags {
+					if strValue, ok := v.(string); ok {
+						point.Tags[k] = strValue
+					} else {
+						// 尝试转换为字符串
+						point.Tags[k] = fmt.Sprintf("%v", v)
+					}
+				}
+			}
+		default:
+			// 处理字段
 			point.Fields[elem.Key] = elem.Value
 		}
 	}
