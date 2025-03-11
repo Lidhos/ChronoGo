@@ -61,6 +61,92 @@ func (mt *MemTable) Put(point *model.TimeSeriesPoint) error {
 	return nil
 }
 
+// PutBatch 批量插入多个时序数据点
+// 一次性获取锁，减少锁竞争
+func (mt *MemTable) PutBatch(points []*model.TimeSeriesPoint) error {
+	if len(points) == 0 {
+		return nil
+	}
+
+	// 如果只有一个点，使用单点插入
+	if len(points) == 1 {
+		return mt.Put(points[0])
+	}
+
+	mt.mu.Lock()
+	defer mt.mu.Unlock()
+
+	// 预分配足够的容量
+	// 估计每个标签索引的平均大小
+	tagKeyCount := make(map[string]int)
+	tagValueCount := make(map[string]map[string]int)
+
+	// 批量处理所有数据点
+	for _, point := range points {
+		// 将数据点转换为BSON
+		doc := point.ToBSON()
+
+		// 序列化为二进制
+		data, err := bson.Marshal(doc)
+		if err != nil {
+			return err
+		}
+
+		// 插入跳表
+		mt.data.Insert(point.Timestamp, data)
+
+		// 统计标签
+		for tagKey, tagValue := range point.Tags {
+			if _, exists := tagKeyCount[tagKey]; !exists {
+				tagKeyCount[tagKey] = 0
+				tagValueCount[tagKey] = make(map[string]int)
+			}
+			tagKeyCount[tagKey]++
+
+			if _, exists := tagValueCount[tagKey][tagValue]; !exists {
+				tagValueCount[tagKey][tagValue] = 0
+			}
+			tagValueCount[tagKey][tagValue]++
+		}
+
+		// 更新大小
+		mt.size += int64(len(data))
+	}
+
+	// 预分配标签索引空间
+	for tagKey, _ := range tagKeyCount {
+		if _, exists := mt.tagIndexes[tagKey]; !exists {
+			mt.tagIndexes[tagKey] = make(map[string][]int64)
+		}
+
+		// 预分配每个标签值的时间戳数组
+		for tagValue, valueCount := range tagValueCount[tagKey] {
+			if _, exists := mt.tagIndexes[tagKey][tagValue]; !exists {
+				// 新建标签值索引
+				mt.tagIndexes[tagKey][tagValue] = make([]int64, 0, valueCount)
+			} else {
+				// 扩展现有标签值索引
+				currentLen := len(mt.tagIndexes[tagKey][tagValue])
+				if cap(mt.tagIndexes[tagKey][tagValue])-currentLen < valueCount {
+					// 需要扩容
+					newSlice := make([]int64, currentLen, currentLen+valueCount)
+					copy(newSlice, mt.tagIndexes[tagKey][tagValue])
+					mt.tagIndexes[tagKey][tagValue] = newSlice
+				}
+			}
+		}
+	}
+
+	// 批量更新标签索引
+	for _, point := range points {
+		for tagKey, tagValue := range point.Tags {
+			mt.tagIndexes[tagKey][tagValue] = append(mt.tagIndexes[tagKey][tagValue], point.Timestamp)
+		}
+	}
+
+	return nil
+}
+
 // Get 获取指定时间戳的数据点
 func (mt *MemTable) Get(timestamp int64) (*model.TimeSeriesPoint, bool) {
 	mt.mu.RLock()

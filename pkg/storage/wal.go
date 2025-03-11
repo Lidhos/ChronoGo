@@ -43,6 +43,7 @@ type WAL struct {
 	mu           sync.Mutex    // 互斥锁
 	syncInterval time.Duration // 同步间隔
 	lastSync     time.Time     // 上次同步时间
+	entryPool    *WALEntryPool // WAL条目对象池
 }
 
 // 全局WALEntry对象池
@@ -64,6 +65,7 @@ func NewWAL(dir string, maxFileSize int64) (*WAL, error) {
 		maxFileSize:  maxFileSize,
 		syncInterval: 200 * time.Millisecond,
 		lastSync:     time.Now(),
+		entryPool:    walEntryPool,
 	}
 
 	// 打开或创建WAL文件
@@ -328,14 +330,14 @@ func (w *WAL) readEntry(file *os.File) (*WALEntry, error) {
 	dataLen := binary.LittleEndian.Uint32(lenBuf)
 
 	// 从对象池获取WALEntry
-	entry := walEntryPool.Get()
+	entry := w.entryPool.Get()
 	entry.Type = entryType
 	entry.Timestamp = timestamp
 
 	// 读取数据库名
 	dbBuf := make([]byte, dbLen)
 	if _, err := io.ReadFull(file, dbBuf); err != nil {
-		walEntryPool.Put(entry)
+		w.entryPool.Put(entry)
 		return nil, err
 	}
 	entry.Database = string(dbBuf)
@@ -343,7 +345,7 @@ func (w *WAL) readEntry(file *os.File) (*WALEntry, error) {
 	// 读取表名
 	tableBuf := make([]byte, tableLen)
 	if _, err := io.ReadFull(file, tableBuf); err != nil {
-		walEntryPool.Put(entry)
+		w.entryPool.Put(entry)
 		return nil, err
 	}
 	entry.Table = string(tableBuf)
@@ -358,7 +360,7 @@ func (w *WAL) readEntry(file *os.File) (*WALEntry, error) {
 		}
 
 		if _, err := io.ReadFull(file, entry.Data); err != nil {
-			walEntryPool.Put(entry)
+			w.entryPool.Put(entry)
 			return nil, err
 		}
 	} else {
@@ -368,7 +370,7 @@ func (w *WAL) readEntry(file *os.File) (*WALEntry, error) {
 	return entry, nil
 }
 
-// CreateInsertEntry 创建插入操作的WAL条目
+// CreateInsertEntry 创建插入类型的WAL条目
 func CreateInsertEntry(db, table string, timestamp int64, doc bson.D) (*WALEntry, error) {
 	// 从对象池获取WALEntry
 	entry := walEntryPool.GetInsertEntry()
@@ -390,7 +392,7 @@ func CreateInsertEntry(db, table string, timestamp int64, doc bson.D) (*WALEntry
 	return entry, nil
 }
 
-// CreateDeleteEntry 创建删除操作的WAL条目
+// CreateDeleteEntry 创建删除类型的WAL条目
 func CreateDeleteEntry(db, table string, timestamp int64) *WALEntry {
 	// 从对象池获取WALEntry
 	entry := walEntryPool.GetDeleteEntry()
@@ -399,4 +401,41 @@ func CreateDeleteEntry(db, table string, timestamp int64) *WALEntry {
 	entry.Timestamp = timestamp
 
 	return entry
+}
+
+// CreateInsertEntryWithPool 使用对象池创建插入类型的WAL条目
+func (w *WAL) CreateInsertEntryWithPool(db, table string, timestamp int64, doc bson.D) (*WALEntry, error) {
+	// 从对象池获取WALEntry
+	entry := w.entryPool.GetInsertEntry()
+	entry.Database = db
+	entry.Table = table
+	entry.Timestamp = timestamp
+
+	// 序列化BSON文档
+	data, err := bson.Marshal(doc)
+	if err != nil {
+		// 发生错误时，将对象放回池中
+		w.entryPool.Put(entry)
+		return nil, fmt.Errorf("failed to marshal BSON document: %w", err)
+	}
+
+	// 设置数据
+	entry.Data = append(entry.Data, data...)
+
+	return entry, nil
+}
+
+// CreateDeleteEntryWithPool 使用对象池创建删除类型的WAL条目
+func (w *WAL) CreateDeleteEntryWithPool(db, table string, timestamp int64) *WALEntry {
+	// 从对象池获取WALEntry
+	entry := w.entryPool.GetDeleteEntry()
+	entry.Database = db
+	entry.Table = table
+	entry.Timestamp = timestamp
+	return entry
+}
+
+// ReleaseEntry 将WAL条目放回对象池
+func (w *WAL) ReleaseEntry(entry *WALEntry) {
+	w.entryPool.Put(entry)
 }

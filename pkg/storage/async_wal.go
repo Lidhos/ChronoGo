@@ -129,7 +129,7 @@ func (aw *AsyncWAL) flushBuffer() error {
 		}
 
 		// 将条目放回对象池
-		walEntryPool.Put(entry)
+		aw.wal.ReleaseEntry(entry)
 	}
 
 	// 清空缓冲区
@@ -176,4 +176,41 @@ func (aw *AsyncWAL) Close() error {
 func (aw *AsyncWAL) Recover() ([]*WALEntry, error) {
 	// 直接使用底层WAL的恢复功能
 	return aw.wal.Recover()
+}
+
+// WriteBatch 批量异步写入WAL条目
+func (aw *AsyncWAL) WriteBatch(entries []*WALEntry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+
+	// 如果只有一个条目，使用单条写入
+	if len(entries) == 1 {
+		return aw.Write(entries[0])
+	}
+
+	// 批量写入
+	aw.mu.Lock()
+	defer aw.mu.Unlock()
+
+	// 预分配足够的空间
+	if cap(aw.buffer)-len(aw.buffer) < len(entries) {
+		// 需要扩容
+		newBuffer := make([]*WALEntry, len(aw.buffer), len(aw.buffer)+len(entries))
+		copy(newBuffer, aw.buffer)
+		aw.buffer = newBuffer
+	}
+
+	// 添加所有条目到缓冲区
+	aw.buffer = append(aw.buffer, entries...)
+
+	// 如果缓冲区达到批处理大小，刷新到WAL
+	if len(aw.buffer) >= aw.batchSize {
+		if err := aw.flushBuffer(); err != nil {
+			logger.Printf("AsyncWAL: 批量刷新缓冲区失败: %v", err)
+			return err
+		}
+	}
+
+	return nil
 }

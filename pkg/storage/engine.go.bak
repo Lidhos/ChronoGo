@@ -2573,3 +2573,20 @@ func (e *StorageEngine) CreatePointWithPool(timestamp int64, tags map[string]str
 func (e *StorageEngine) ReleasePoint(point *model.TimeSeriesPoint) {
 	e.pointPool.Put(point)
 }
+
+// ReleasePoints 批量将时序数据点放回对象池
+func (e *StorageEngine) ReleasePoints(points []*model.TimeSeriesPoint) {
+	for _, point := range points {
+		e.pointPool.Put(point)
+	}
+}
+
+// SafeReleasePoints 安全地批量将时序数据点放回对象池
+// 会检查每个点是否为nil，适用于可能包含nil的点集合
+func (e *StorageEngine) SafeReleasePoints(points []*model.TimeSeriesPoint) {
+	for _, point := range points {
+		if point != nil {
+			e.pointPool.Put(point)
+		}
+	}
+}
