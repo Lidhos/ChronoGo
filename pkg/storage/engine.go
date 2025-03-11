@@ -710,8 +710,8 @@ func (e *StorageEngine) CreateTable(dbName, tableName string, schema model.Schem
 
 // InsertPoint 插入时序数据点
 func (e *StorageEngine) InsertPoint(dbName, tableName string, point *model.TimeSeriesPoint) error {
-	// 获取表读锁
-	unlock := e.lockManager.LockTable(dbName, tableName, false)
+	// 获取表写锁
+	unlock := e.lockManager.LockTable(dbName, tableName, true)
 	defer unlock()
 
 	// 检查数据库和表是否存在
@@ -2260,5 +2260,55 @@ func (e *StorageEngine) ClearTable(dbName, tableName string) error {
 	}
 
 	logger.Printf("表 %s.%s 清空成功\n", dbName, tableName)
+	return nil
+}
+
+// InsertPoints 批量插入时序数据点
+func (e *StorageEngine) InsertPoints(dbName, tableName string, points []*model.TimeSeriesPoint) error {
+	if len(points) == 0 {
+		return nil
+	}
+
+	// 获取表写锁
+	unlock := e.lockManager.LockTable(dbName, tableName, true)
+	defer unlock()
+
+	// 检查数据库和表是否存在
+	db, dbExists := e.databases[dbName]
+	if !dbExists {
+		return fmt.Errorf("database %s does not exist", dbName)
+	}
+
+	_, tableExists := db.Tables[tableName]
+	if !tableExists {
+		return fmt.Errorf("table %s does not exist in database %s", tableName, dbName)
+	}
+
+	// 获取内存表
+	memTable, err := e.getOrCreateMemTable(dbName, tableName)
+	if err != nil {
+		return fmt.Errorf("failed to get memtable: %w", err)
+	}
+
+	// 创建WAL条目并插入数据点
+	for _, point := range points {
+		// 创建WAL条目
+		doc := point.ToBSON()
+		entry, err := CreateInsertEntry(dbName, tableName, point.Timestamp, doc)
+		if err != nil {
+			return fmt.Errorf("failed to create WAL entry: %w", err)
+		}
+
+		// 写入WAL
+		if err := e.wal.Write(entry); err != nil {
+			return fmt.Errorf("failed to write to WAL: %w", err)
+		}
+
+		// 插入数据点
+		if err := memTable.Put(point); err != nil {
+			return fmt.Errorf("failed to insert data point: %w", err)
+		}
+	}
+
 	return nil
 }

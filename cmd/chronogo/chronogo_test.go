@@ -525,6 +525,76 @@ func BenchmarkTimeSeriesInsert(b *testing.B) {
 	}
 }
 
+// 测试批量插入性能基准
+func BenchmarkTimeSeriesBatchInsert(b *testing.B) {
+	// 创建客户端
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	clientOptions := options.Client().
+		ApplyURI(testMongoURIFull).
+		SetServerSelectionTimeout(15 * time.Second).
+		SetConnectTimeout(15 * time.Second).
+		SetDirect(true)
+
+	client, err := mongo.Connect(ctx, clientOptions)
+	if err != nil {
+		b.Fatalf("无法创建MongoDB客户端: %v", err)
+	}
+	defer client.Disconnect(ctx)
+
+	// 创建测试数据库和集合
+	dbName := fmt.Sprintf("%s_batch", testDatabaseNameFull)
+	collName := fmt.Sprintf("%s_batch", testTimeSeriesName)
+	db := client.Database(dbName)
+
+	// 删除可能存在的集合
+	db.Collection(collName).Drop(ctx)
+
+	// 创建普通集合，不使用时序集合选项
+	err = db.CreateCollection(ctx, collName)
+	if err != nil {
+		b.Fatalf("创建集合失败: %v", err)
+	}
+	defer db.Collection(collName).Drop(ctx)
+
+	// 批量大小
+	const batchSize = 100
+
+	// 重置计时器
+	b.ResetTimer()
+
+	// 执行基准测试
+	for i := 0; i < b.N; i++ {
+		// 准备批量测试数据
+		now := time.Now()
+		documents := make(bson.A, batchSize)
+
+		for j := 0; j < batchSize; j++ {
+			documents[j] = bson.D{
+				{"timestamp", now.Add(time.Duration(j) * time.Second).Format(time.RFC3339)},
+				{"value", float64(20 + j%10)},
+				{"tags", bson.D{
+					{"sensor", fmt.Sprintf("sensor_%d", j%5)},
+					{"location", fmt.Sprintf("location_%d", j%3)},
+				}},
+			}
+		}
+
+		// 使用 insert 命令批量插入文档
+		insertCmd := bson.D{
+			{"insert", collName},
+			{"documents", documents},
+		}
+
+		var insertResult bson.M
+		err = db.RunCommand(ctx, insertCmd).Decode(&insertResult)
+		if err != nil {
+			b.Fatalf("批量插入时序数据失败: %v", err)
+		}
+	}
+}
+
 // 测试清空集合命令
 func TestClearCommand(t *testing.T) {
 	client, ctx, cancel := createTestClient(t)

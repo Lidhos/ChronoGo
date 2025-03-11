@@ -1648,22 +1648,15 @@ func registerCommands(handler *protocol.CommandHandler, storageEngine *storage.S
 		var dbName, collName string
 		var document interface{}
 
+		// 解析命令参数
 		for _, elem := range cmd {
 			switch elem.Key {
 			case "insertOne":
-				if doc, ok := elem.Value.(bson.D); ok {
-					for _, field := range doc {
-						if field.Key == "document" {
-							document = field.Value
-							logger.Printf("insertOne命令: 找到文档")
-						}
-					}
-				}
-			case "collection":
-				if str, ok := elem.Value.(string); ok {
-					collName = str
-					logger.Printf("insertOne命令: 集合名称: %s", collName)
-				}
+				collName = elem.Value.(string)
+				logger.Printf("insertOne命令: 集合名称: %s", collName)
+			case "document":
+				document = elem.Value
+				logger.Printf("insertOne命令: 找到文档")
 			case "$db":
 				if str, ok := elem.Value.(string); ok {
 					dbName = str
@@ -1762,6 +1755,125 @@ func registerCommands(handler *protocol.CommandHandler, storageEngine *storage.S
 			{"ok", 1},
 			{"n", 1},
 		}, nil
+	})
+
+	// 批量插入文档命令
+	handler.Register("insertMany", func(ctx context.Context, cmd bson.D) (bson.D, error) {
+		logger.Printf("insertMany命令: 开始处理")
+
+		var dbName, collName string
+		var documents []interface{}
+
+		// 解析命令参数
+		for _, elem := range cmd {
+			switch elem.Key {
+			case "insertMany":
+				collName = elem.Value.(string)
+				logger.Printf("insertMany命令: 集合名称: %s", collName)
+			case "documents":
+				if docs, ok := elem.Value.(bson.A); ok {
+					documents = make([]interface{}, len(docs))
+					for i, doc := range docs {
+						documents[i] = doc
+					}
+					logger.Printf("insertMany命令: 文档数量: %d", len(documents))
+				}
+			case "$db":
+				if str, ok := elem.Value.(string); ok {
+					dbName = str
+					logger.Printf("insertMany命令: 数据库名称: %s", dbName)
+				}
+			}
+		}
+
+		// 如果没有指定数据库，使用当前会话的数据库
+		if dbName == "" {
+			session, ok := ctx.Value("session").(*protocol.Session)
+			if ok && session.CurrentDB != "" {
+				dbName = session.CurrentDB
+				logger.Printf("insertMany命令: 使用会话数据库: %s", dbName)
+			}
+		}
+
+		if dbName == "" {
+			logger.Printf("insertMany命令: 缺少数据库名称")
+			return nil, fmt.Errorf("missing database name")
+		}
+
+		if collName == "" {
+			logger.Printf("insertMany命令: 缺少集合名称")
+			return nil, fmt.Errorf("missing collection name")
+		}
+
+		if len(documents) == 0 {
+			logger.Printf("insertMany命令: 没有要插入的文档")
+			return nil, fmt.Errorf("no documents to insert")
+		}
+
+		// 检查数据库和集合是否存在
+		databases, err := storageEngine.ListDatabases()
+		if err != nil {
+			logger.Printf("insertMany命令: 获取数据库列表失败: %v", err)
+			return nil, err
+		}
+
+		dbExists := false
+		var db *model.Database
+		for _, d := range databases {
+			if d.Name == dbName {
+				dbExists = true
+				db = d
+				break
+			}
+		}
+
+		if !dbExists {
+			logger.Printf("insertMany命令: 数据库 %s 不存在", dbName)
+			return nil, fmt.Errorf("database %s does not exist", dbName)
+		}
+
+		tableExists := false
+		if db != nil {
+			_, tableExists = db.Tables[collName]
+		}
+
+		if !tableExists {
+			logger.Printf("insertMany命令: 集合 %s 在数据库 %s 中不存在", collName, dbName)
+			return nil, fmt.Errorf("collection %s does not exist in database %s", collName, dbName)
+		}
+
+		// 批量插入文档
+		logger.Printf("insertMany命令: 开始批量插入文档到 %s.%s", dbName, collName)
+
+		// 将文档转换为时序数据点
+		points := make([]*model.TimeSeriesPoint, 0, len(documents))
+		for _, doc := range documents {
+			if bsonDoc, ok := doc.(bson.D); ok {
+				// 创建时序数据点
+				point := &model.TimeSeriesPoint{
+					Timestamp: time.Now().UnixNano(),
+					Tags:      make(map[string]string),
+					Fields:    make(map[string]interface{}),
+				}
+
+				// 解析文档字段
+				for _, field := range bsonDoc {
+					// 假设所有字段都是普通字段
+					point.Fields[field.Key] = field.Value
+				}
+
+				points = append(points, point)
+			}
+		}
+
+		// 批量插入数据点
+		if err := storageEngine.InsertPoints(dbName, collName, points); err != nil {
+			logger.Printf("insertMany命令: 批量插入文档失败: %v", err)
+			return nil, err
+		}
+
+		logger.Printf("insertMany命令: 文档批量插入成功")
+		return bson.D{{"ok", 1}, {"n", len(points)}}, nil
 	})
 }
 
