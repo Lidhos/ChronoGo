@@ -25,21 +25,22 @@ import (
 
 // StorageEngine 表示时序存储引擎
 type StorageEngine struct {
-	dataDir      string                     // 数据目录
-	walDir       string                     // WAL目录
-	metaDir      string                     // 元数据目录
-	coldDir      string                     // 冷数据目录
-	databases    map[string]*model.Database // 数据库映射
-	memTables    map[string]*MemTable       // 内存表映射 (db:table -> memtable)
-	wal          *WAL                       // 预写日志
-	asyncWAL     *AsyncWAL                  // 异步预写日志
-	writeBuffer  *WriteBuffer               // 写缓冲区
-	indexMgr     index.IndexManager         // 索引管理器
-	flushTicker  *time.Ticker               // 刷盘定时器
-	storageTiers []model.StorageTier        // 存储层级
-	mu           sync.RWMutex               // 读写锁（旧的锁，将逐步替换）
-	lockManager  *LockManager               // 锁管理器
-	closing      chan struct{}              // 关闭信号
+	dataDir           string                     // 数据目录
+	walDir            string                     // WAL目录
+	metaDir           string                     // 元数据目录
+	coldDir           string                     // 冷数据目录
+	databases         map[string]*model.Database // 数据库映射
+	memTables         map[string]*MemTable       // 内存表映射 (db:table -> memtable)
+	wal               *WAL                       // 预写日志
+	asyncWAL          *AsyncWAL                  // 异步预写日志
+	writeBuffer       *WriteBuffer               // 写缓冲区
+	indexMgr          index.IndexManager         // 索引管理器
+	asyncIndexUpdater *AsyncIndexUpdater         // 异步索引更新器
+	flushTicker       *time.Ticker               // 刷盘定时器
+	storageTiers      []model.StorageTier        // 存储层级
+	mu                sync.RWMutex               // 读写锁（旧的锁，将逐步替换）
+	lockManager       *LockManager               // 锁管理器
+	closing           chan struct{}              // 关闭信号
 }
 
 // QueryOptimizer 查询优化器
@@ -111,6 +112,11 @@ func NewStorageEngine(baseDir string) (*StorageEngine, error) {
 	// 参数: 存储引擎, 批处理大小, 刷新间隔
 	writeBuffer := NewWriteBuffer(engine, 100, 100*time.Millisecond)
 	engine.writeBuffer = writeBuffer
+
+	// 创建异步索引更新器
+	// 参数: 索引管理器, 队列大小, 批处理大小, 刷新间隔, 工作线程数
+	asyncIndexUpdater := NewAsyncIndexUpdater(indexMgr, 10000, 100, 100*time.Millisecond, 2)
+	engine.asyncIndexUpdater = asyncIndexUpdater
 
 	// 启动后台任务
 	engine.startBackgroundTasks()
@@ -778,56 +784,64 @@ func (e *StorageEngine) InsertPointSync(dbName, tableName string, point *model.T
 		return fmt.Errorf("failed to insert data point: %w", err)
 	}
 
-	// 更新索引
-	ctx := context.Background()
-
 	// 生成唯一的时间序列ID
 	seriesID := fmt.Sprintf("%s:%s:%d", dbName, tableName, point.Timestamp)
 
-	// 更新标签索引
-	for _, tagIndex := range table.TagIndexes {
-		// 获取索引
-		idx, err := e.indexMgr.GetIndex(ctx, dbName, tableName, tagIndex.Name)
-		if err != nil {
-			// 索引不存在，跳过
-			continue
+	// 使用异步索引更新器
+	if e.asyncIndexUpdater != nil {
+		// 批量更新索引
+		if err := e.asyncIndexUpdater.BatchUpdateIndex(dbName, tableName, point, seriesID, table.TagIndexes, table.Schema.TimeField); err != nil {
+			logger.Printf("批量更新索引失败: %v", err)
 		}
+	} else {
+		// 如果异步索引更新器不可用，则使用同步方式更新索引
+		ctx := context.Background()
 
-		// 根据索引字段数量决定如何更新索引
-		if len(tagIndex.Fields) == 1 {
-			// 单字段索引
-			field := tagIndex.Fields[0]
-			if value, ok := point.Tags[field]; ok {
+		// 更新标签索引
+		for _, tagIndex := range table.TagIndexes {
+			// 获取索引
+			idx, err := e.indexMgr.GetIndex(ctx, dbName, tableName, tagIndex.Name)
+			if err != nil {
+				// 索引不存在，跳过
+				continue
+			}
+
+			// 根据索引字段数量决定如何更新索引
+			if len(tagIndex.Fields) == 1 {
+				// 单字段索引
+				field := tagIndex.Fields[0]
+				if value, ok := point.Tags[field]; ok {
+					// 更新索引
+					if err := idx.Insert(ctx, value, seriesID); err != nil {
+						return fmt.Errorf("failed to update index %s: %w", tagIndex.Name, err)
+					}
+				}
+			} else {
+				// 复合索引
+				values := make([]string, len(tagIndex.Fields))
+				for i, field := range tagIndex.Fields {
+					if value, ok := point.Tags[field]; ok {
+						values[i] = value
+					} else {
+						values[i] = "" // 字段不存在，使用空字符串
+					}
+				}
 				// 更新索引
-				if err := idx.Insert(ctx, value, seriesID); err != nil {
+				if err := idx.Insert(ctx, values, seriesID); err != nil {
 					return fmt.Errorf("failed to update index %s: %w", tagIndex.Name, err)
 				}
 			}
-		} else {
-			// 复合索引
-			values := make([]string, len(tagIndex.Fields))
-			for i, field := range tagIndex.Fields {
-				if value, ok := point.Tags[field]; ok {
-					values[i] = value
-				} else {
-					values[i] = "" // 字段不存在，使用空字符串
-				}
-			}
-			// 更新索引
-			if err := idx.Insert(ctx, values, seriesID); err != nil {
-				return fmt.Errorf("failed to update index %s: %w", tagIndex.Name, err)
-			}
 		}
-	}
 
-	// 更新时间索引
-	if table.Schema.TimeField != "" {
-		// 获取时间索引
-		timeIdx, err := e.indexMgr.GetIndex(ctx, dbName, tableName, "time_idx")
-		if err == nil {
-			// 更新时间索引
-			if err := timeIdx.Insert(ctx, point.Timestamp, seriesID); err != nil {
-				return fmt.Errorf("failed to update time index: %w", err)
+		// 更新时间索引
+		if table.Schema.TimeField != "" {
+			// 获取时间索引
+			timeIdx, err := e.indexMgr.GetIndex(ctx, dbName, tableName, "time_idx")
+			if err == nil {
+				// 更新时间索引
+				if err := timeIdx.Insert(ctx, point.Timestamp, seriesID); err != nil {
+					return fmt.Errorf("failed to update time index: %w", err)
+				}
 			}
 		}
 	}
@@ -1011,6 +1025,13 @@ func (e *StorageEngine) Close() error {
 	if e.writeBuffer != nil {
 		if err := e.writeBuffer.Close(); err != nil {
 			return fmt.Errorf("failed to close write buffer: %w", err)
+		}
+	}
+
+	// 关闭异步索引更新器
+	if e.asyncIndexUpdater != nil {
+		if err := e.asyncIndexUpdater.Close(); err != nil {
+			return fmt.Errorf("failed to close async index updater: %w", err)
 		}
 	}
 
@@ -2344,7 +2365,7 @@ func (e *StorageEngine) InsertPointsSync(dbName, tableName string, points []*mod
 		return fmt.Errorf("database %s does not exist", dbName)
 	}
 
-	_, tableExists := db.Tables[tableName]
+	table, tableExists := db.Tables[tableName]
 	if !tableExists {
 		return fmt.Errorf("table %s does not exist in database %s", tableName, dbName)
 	}
@@ -2355,8 +2376,11 @@ func (e *StorageEngine) InsertPointsSync(dbName, tableName string, points []*mod
 		return fmt.Errorf("failed to get memtable: %w", err)
 	}
 
+	// 预先生成所有点的seriesID
+	seriesIDs := make([]string, len(points))
+
 	// 创建WAL条目并插入数据点
-	for _, point := range points {
+	for i, point := range points {
 		// 创建WAL条目
 		doc := point.ToBSON()
 		entry, err := CreateInsertEntry(dbName, tableName, point.Timestamp, doc)
@@ -2379,6 +2403,73 @@ func (e *StorageEngine) InsertPointsSync(dbName, tableName string, points []*mod
 		// 插入数据点
 		if err := memTable.Put(point); err != nil {
 			return fmt.Errorf("failed to insert data point: %w", err)
+		}
+
+		// 生成唯一的时间序列ID
+		seriesIDs[i] = fmt.Sprintf("%s:%s:%d", dbName, tableName, point.Timestamp)
+	}
+
+	// 使用异步索引更新器
+	if e.asyncIndexUpdater != nil {
+		// 批量更新所有点的索引
+		if err := e.asyncIndexUpdater.BatchUpdateIndexForPoints(dbName, tableName, points, seriesIDs, table.TagIndexes, table.Schema.TimeField); err != nil {
+			logger.Printf("批量更新索引失败: %v", err)
+		}
+	} else {
+		// 如果异步索引更新器不可用，则使用同步方式更新索引
+		ctx := context.Background()
+
+		// 为每个点更新索引
+		for i, point := range points {
+			seriesID := seriesIDs[i]
+
+			// 更新标签索引
+			for _, tagIndex := range table.TagIndexes {
+				// 获取索引
+				idx, err := e.indexMgr.GetIndex(ctx, dbName, tableName, tagIndex.Name)
+				if err != nil {
+					// 索引不存在，跳过
+					continue
+				}
+
+				// 根据索引字段数量决定如何更新索引
+				if len(tagIndex.Fields) == 1 {
+					// 单字段索引
+					field := tagIndex.Fields[0]
+					if value, ok := point.Tags[field]; ok {
+						// 更新索引
+						if err := idx.Insert(ctx, value, seriesID); err != nil {
+							return fmt.Errorf("failed to update index %s: %w", tagIndex.Name, err)
+						}
+					}
+				} else {
+					// 复合索引
+					values := make([]string, len(tagIndex.Fields))
+					for i, field := range tagIndex.Fields {
+						if value, ok := point.Tags[field]; ok {
+							values[i] = value
+						} else {
+							values[i] = "" // 字段不存在，使用空字符串
+						}
+					}
+					// 更新索引
+					if err := idx.Insert(ctx, values, seriesID); err != nil {
+						return fmt.Errorf("failed to update index %s: %w", tagIndex.Name, err)
+					}
+				}
+			}
+
+			// 更新时间索引
+			if table.Schema.TimeField != "" {
+				// 获取时间索引
+				timeIdx, err := e.indexMgr.GetIndex(ctx, dbName, tableName, "time_idx")
+				if err == nil {
+					// 更新时间索引
+					if err := timeIdx.Insert(ctx, point.Timestamp, seriesID); err != nil {
+						return fmt.Errorf("failed to update time index: %w", err)
+					}
+				}
+			}
 		}
 	}
 
