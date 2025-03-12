@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"ChronoGo/pkg/logger"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -438,4 +439,45 @@ func (w *WAL) CreateDeleteEntryWithPool(db, table string, timestamp int64) *WALE
 // ReleaseEntry 将WAL条目放回对象池
 func (w *WAL) ReleaseEntry(entry *WALEntry) {
 	w.entryPool.Put(entry)
+}
+
+// Checkpoint 创建WAL检查点，清理已持久化的WAL条目
+func (w *WAL) Checkpoint() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	// 获取所有WAL文件
+	files, err := filepath.Glob(filepath.Join(w.dir, "*.wal"))
+	if err != nil {
+		return fmt.Errorf("failed to list WAL files: %w", err)
+	}
+
+	// 按文件序号排序
+	sort.Strings(files)
+
+	// 如果只有一个或没有WAL文件，不需要清理
+	if len(files) <= 1 {
+		return nil
+	}
+
+	// 获取当前WAL文件路径
+	currentFilePath := w.currentFile.Name()
+
+	// 保留当前文件和最近的一个文件，删除其他文件
+	// 这是一个简单的实现，实际上应该基于持久化状态决定哪些文件可以删除
+	for i := 0; i < len(files)-1; i++ {
+		// 跳过当前文件
+		if files[i] == currentFilePath {
+			continue
+		}
+
+		// 删除旧文件
+		if err := os.Remove(files[i]); err != nil {
+			logger.Printf("Failed to remove WAL file %s: %v", files[i], err)
+		} else {
+			logger.Printf("Checkpoint: removed WAL file %s", files[i])
+		}
+	}
+
+	return nil
 }

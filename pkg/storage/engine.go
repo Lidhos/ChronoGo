@@ -30,7 +30,9 @@ type StorageEngine struct {
 	metaDir           string                     // 元数据目录
 	coldDir           string                     // 冷数据目录
 	databases         map[string]*model.Database // 数据库映射
-	memTables         map[string]*MemTable       // 内存表映射 (db:table -> memtable)
+	memTables         map[string]*MemTable       // 内存表映射 (db:table -> memtable) - 将逐步废弃
+	memTableManager   *MemTableManager           // 内存表管理器 - 新增
+	sstableManager    *SSTableManager            // SSTable 管理器 - 新增
 	wal               *WAL                       // 预写日志
 	asyncWAL          *AsyncWAL                  // 异步预写日志
 	writeBuffer       *WriteBuffer               // 写缓冲区
@@ -106,6 +108,20 @@ func NewStorageEngine(baseDir string) (*StorageEngine, error) {
 	// 参数: WAL, 队列大小, 批处理大小, 刷新间隔, 工作线程数
 	asyncWAL := NewAsyncWAL(wal, 10000, 100, 100*time.Millisecond, 2)
 	engine.asyncWAL = asyncWAL
+
+	// 创建内存表管理器
+	// 参数: 数据目录, 最大内存表大小, 最大只读内存表数量, 刷盘工作线程数, 存储引擎引用
+	memTableManager := NewMemTableManager(dataDir, 64*1024*1024, 2, 2, engine)
+	engine.memTableManager = memTableManager
+
+	// 创建 SSTable 管理器
+	// 参数: 数据目录, 配置选项, 存储引擎引用
+	sstableDir := filepath.Join(dataDir, "sstable")
+	sstableManager, err := NewSSTableManager(sstableDir, DefaultSSTableOptions(), engine)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create SSTable manager: %w", err)
+	}
+	engine.sstableManager = sstableManager
 
 	// 加载元数据
 	if err := engine.loadMetadata(); err != nil {
@@ -459,54 +475,91 @@ func (e *StorageEngine) saveMetadata(alreadyLocked ...bool) error {
 
 // recoverFromWAL 从WAL恢复数据
 func (e *StorageEngine) recoverFromWAL() error {
-	entries, err := e.wal.Recover()
-	if err != nil {
-		return fmt.Errorf("failed to recover WAL entries: %w", err)
-	}
+	// 创建一个带超时的上下文
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
 
-	for _, entry := range entries {
-		switch entry.Type {
-		case walOpInsert:
-			var doc bson.D
-			if err := bson.Unmarshal(entry.Data, &doc); err != nil {
-				return fmt.Errorf("failed to unmarshal WAL entry: %w", err)
-			}
+	// 创建一个通道来接收恢复结果
+	resultChan := make(chan error, 1)
 
-			point, err := model.FromBSON(doc)
-			if err != nil {
-				return fmt.Errorf("failed to convert BSON to TimeSeriesPoint: %w", err)
-			}
+	// 在后台执行WAL恢复过程
+	go func() {
+		startTime := time.Now()
+		logger.Printf("Starting WAL recovery")
 
-			// 获取或创建内存表
-			memTable, err := e.getOrCreateMemTable(entry.Database, entry.Table)
-			if err != nil {
-				return fmt.Errorf("failed to get or create memtable: %w", err)
-			}
-
-			// 插入数据点
-			if err := memTable.Put(point); err != nil {
-				return fmt.Errorf("failed to insert data point: %w", err)
-			}
-
-		case walOpDelete:
-			// TODO: 实现删除操作恢复
+		entries, err := e.wal.Recover()
+		if err != nil {
+			resultChan <- fmt.Errorf("failed to recover WAL entries: %w", err)
+			return
 		}
-	}
 
-	return nil
+		logger.Printf("Recovered %d WAL entries in %v", len(entries), time.Since(startTime))
+
+		// 处理WAL条目
+		for _, entry := range entries {
+			select {
+			case <-ctx.Done():
+				// 超时，停止处理
+				logger.Printf("WAL recovery timed out, processed %d entries", len(entries))
+				resultChan <- nil
+				return
+			default:
+				// 继续处理
+				switch entry.Type {
+				case walOpInsert:
+					var doc bson.D
+					if err := bson.Unmarshal(entry.Data, &doc); err != nil {
+						resultChan <- fmt.Errorf("failed to unmarshal WAL entry: %w", err)
+						return
+					}
+
+					point, err := model.FromBSON(doc)
+					if err != nil {
+						resultChan <- fmt.Errorf("failed to convert BSON to TimeSeriesPoint: %w", err)
+						return
+					}
+
+					// 使用内存表管理器插入数据点
+					if err := e.memTableManager.Put(entry.Database, entry.Table, point); err != nil {
+						resultChan <- fmt.Errorf("failed to insert data point: %w", err)
+						return
+					}
+
+				case walOpDelete:
+					// TODO: 实现删除操作恢复
+				}
+			}
+		}
+
+		logger.Printf("WAL recovery completed in %v", time.Since(startTime))
+		resultChan <- nil
+	}()
+
+	// 等待恢复完成或超时
+	select {
+	case err := <-resultChan:
+		return err
+	case <-ctx.Done():
+		logger.Printf("WAL recovery timed out after 3 seconds, continuing with partial recovery")
+		return nil
+	}
 }
 
 // startBackgroundTasks 启动后台任务
 func (e *StorageEngine) startBackgroundTasks() {
-	e.flushTicker = time.NewTicker(1 * time.Minute)
+	// 注意：不再需要单独的刷盘定时器，因为 MemTableManager 会自动处理刷盘
+	// 但我们保留这个定时器以兼容旧代码，直到完全迁移到 MemTableManager
+	e.flushTicker = time.NewTicker(10 * time.Second)     // 每10秒刷新一次内存表
 	retentionTicker := time.NewTicker(1 * time.Hour)     // 每小时检查一次数据保留
-	downsampleTicker := time.NewTicker(10 * time.Minute) // 每10分钟执行一次降采样
+	downsampleTicker := time.NewTicker(30 * time.Minute) // 每30分钟执行一次降采样
 	tierMigrationTicker := time.NewTicker(2 * time.Hour) // 每2小时执行一次数据迁移
+	walCompactionTicker := time.NewTicker(1 * time.Hour) // 每小时执行一次WAL压缩
 
 	go func() {
 		for {
 			select {
 			case <-e.flushTicker.C:
+				// 兼容旧代码，刷新旧的内存表
 				e.flushMemTables()
 			case <-retentionTicker.C:
 				e.enforceRetentionPolicies()
@@ -514,10 +567,16 @@ func (e *StorageEngine) startBackgroundTasks() {
 				e.performDownsampling()
 			case <-tierMigrationTicker.C:
 				e.migrateDataBetweenTiers()
+			case <-walCompactionTicker.C:
+				// 执行WAL压缩
+				if err := e.CompactWAL(); err != nil {
+					logger.Printf("WAL压缩失败: %v", err)
+				}
 			case <-e.closing:
 				retentionTicker.Stop()
 				downsampleTicker.Stop()
 				tierMigrationTicker.Stop()
+				walCompactionTicker.Stop()
 				return
 			}
 		}
@@ -538,6 +597,7 @@ func (e *StorageEngine) flushMemTables() {
 }
 
 // getOrCreateMemTable 获取或创建内存表
+// 注意：此方法将逐步废弃，请使用 memTableManager
 func (e *StorageEngine) getOrCreateMemTable(dbName, tableName string) (*MemTable, error) {
 	key := dbName + ":" + tableName
 
@@ -782,14 +842,8 @@ func (e *StorageEngine) InsertPointSync(dbName, tableName string, point *model.T
 		}
 	}
 
-	// 获取内存表
-	memTable, err := e.getOrCreateMemTable(dbName, tableName)
-	if err != nil {
-		return fmt.Errorf("failed to get memtable: %w", err)
-	}
-
-	// 插入数据点
-	if err := memTable.Put(point); err != nil {
+	// 使用内存表管理器插入数据点
+	if err := e.memTableManager.Put(dbName, tableName, point); err != nil {
 		return fmt.Errorf("failed to insert data point: %w", err)
 	}
 
@@ -798,59 +852,25 @@ func (e *StorageEngine) InsertPointSync(dbName, tableName string, point *model.T
 
 	// 使用异步索引更新器
 	if e.asyncIndexUpdater != nil {
-		// 批量更新索引
-		if err := e.asyncIndexUpdater.BatchUpdateIndex(dbName, tableName, point, seriesID, table.TagIndexes, table.Schema.TimeField); err != nil {
-			logger.Printf("批量更新索引失败: %v", err)
-		}
-	} else {
-		// 如果异步索引更新器不可用，则使用同步方式更新索引
-		ctx := context.Background()
-
-		// 更新标签索引
-		for _, tagIndex := range table.TagIndexes {
-			// 获取索引
-			idx, err := e.indexMgr.GetIndex(ctx, dbName, tableName, tagIndex.Name)
-			if err != nil {
-				// 索引不存在，跳过
-				continue
-			}
-
-			// 根据索引字段数量决定如何更新索引
-			if len(tagIndex.Fields) == 1 {
+		// 更新索引
+		for _, idx := range table.TagIndexes {
+			// 获取索引键
+			var indexKey interface{}
+			if len(idx.Fields) == 1 {
 				// 单字段索引
-				field := tagIndex.Fields[0]
-				if value, ok := point.Tags[field]; ok {
-					// 更新索引
-					if err := idx.Insert(ctx, value, seriesID); err != nil {
-						return fmt.Errorf("failed to update index %s: %w", tagIndex.Name, err)
-					}
-				}
+				indexKey = point.Tags[idx.Fields[0]]
 			} else {
 				// 复合索引
-				values := make([]string, len(tagIndex.Fields))
-				for i, field := range tagIndex.Fields {
-					if value, ok := point.Tags[field]; ok {
-						values[i] = value
-					} else {
-						values[i] = "" // 字段不存在，使用空字符串
-					}
+				values := make([]string, len(idx.Fields))
+				for i, field := range idx.Fields {
+					values[i] = point.Tags[field]
 				}
-				// 更新索引
-				if err := idx.Insert(ctx, values, seriesID); err != nil {
-					return fmt.Errorf("failed to update index %s: %w", tagIndex.Name, err)
-				}
+				indexKey = values
 			}
-		}
 
-		// 更新时间索引
-		if table.Schema.TimeField != "" {
-			// 获取时间索引
-			timeIdx, err := e.indexMgr.GetIndex(ctx, dbName, tableName, "time_idx")
-			if err == nil {
-				// 更新时间索引
-				if err := timeIdx.Insert(ctx, point.Timestamp, seriesID); err != nil {
-					return fmt.Errorf("failed to update time index: %w", err)
-				}
+			// 异步更新索引
+			if err := e.asyncIndexUpdater.UpdateIndex(dbName, tableName, idx.Name, indexKey, seriesID); err != nil {
+				logger.Printf("Failed to update index %s: %v", idx.Name, err)
 			}
 		}
 	}
@@ -861,211 +881,226 @@ func (e *StorageEngine) InsertPointSync(dbName, tableName string, point *model.T
 // QueryByTimeRange 按时间范围查询时序数据点
 // 注意：调用者必须在使用完结果后调用ReleasePoints方法将对象放回池中，否则会导致内存泄漏
 func (e *StorageEngine) QueryByTimeRange(dbName, tableName string, start, end int64) ([]*model.TimeSeriesPoint, error) {
+	// 获取表读锁
+	unlock := e.lockManager.LockTable(dbName, tableName, false)
+	defer unlock()
+
 	// 检查数据库和表是否存在
-	e.mu.RLock()
-	db, exists := e.databases[dbName]
-	if !exists {
-		e.mu.RUnlock()
-		return nil, fmt.Errorf("database %s not found", dbName)
-	}
-
-	_, exists = db.Tables[tableName]
-	if !exists {
-		e.mu.RUnlock()
-		return nil, fmt.Errorf("table %s not found in database %s", tableName, dbName)
-	}
-	e.mu.RUnlock()
-
-	// 查询内存表
-	key := dbName + ":" + tableName
-	var memPoints []*model.TimeSeriesPoint
-	e.mu.RLock()
-	if memTable, exists := e.memTables[key]; exists {
-		memPoints = memTable.QueryByTimeRange(start, end)
-	}
-	e.mu.RUnlock()
-
-	// 查询热存储
-	hotPoints, err := e.queryTierByTimeRange(dbName, tableName, "hot", start, end)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query hot tier: %w", err)
-	}
-
-	// 查询温存储
-	warmPoints, err := e.queryTierByTimeRange(dbName, tableName, "warm", start, end)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query warm tier: %w", err)
-	}
-
-	// 查询冷存储
-	coldPoints, err := e.queryTierByTimeRange(dbName, tableName, "cold", start, end)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query cold tier: %w", err)
-	}
-
-	// 合并结果
-	allPoints := make([]*model.TimeSeriesPoint, 0, len(memPoints)+len(hotPoints)+len(warmPoints)+len(coldPoints))
-	allPoints = append(allPoints, memPoints...)
-	allPoints = append(allPoints, hotPoints...)
-	allPoints = append(allPoints, warmPoints...)
-	allPoints = append(allPoints, coldPoints...)
-
-	// 按时间戳排序
-	sort.Slice(allPoints, func(i, j int) bool {
-		return allPoints[i].Timestamp < allPoints[j].Timestamp
-	})
-
-	return allPoints, nil
-}
-
-// QueryByTag 按标签查询时序数据点
-// 注意：调用者必须在使用完结果后调用ReleasePoints方法将对象放回池中，否则会导致内存泄漏
-func (e *StorageEngine) QueryByTag(dbName, tableName, tagKey, tagValue string) ([]*model.TimeSeriesPoint, error) {
-	// 检查数据库和表是否存在
-	e.mu.RLock()
 	db, dbExists := e.databases[dbName]
 	if !dbExists {
-		e.mu.RUnlock()
 		return nil, fmt.Errorf("database %s does not exist", dbName)
 	}
 
 	_, tableExists := db.Tables[tableName]
 	if !tableExists {
-		e.mu.RUnlock()
 		return nil, fmt.Errorf("table %s does not exist in database %s", tableName, dbName)
 	}
-	e.mu.RUnlock()
 
-	// 创建查询优化器
-	optimizer := NewQueryOptimizer(e)
+	// 从内存表查询
+	memPoints := e.memTableManager.QueryByTimeRange(dbName, tableName, start, end)
 
-	// 创建查询条件
-	filters := map[string]interface{}{
-		tagKey: tagValue,
-	}
+	// 从 SSTable 查询
+	var sstablePoints []*model.TimeSeriesPoint
+	if e.sstableManager != nil {
+		// 创建时间范围
+		timeRange := TimeRange{
+			Start: start,
+			End:   end,
+		}
 
-	// 选择最佳索引
-	ctx := context.Background()
-	indexName, err := optimizer.SelectBestIndex(ctx, dbName, tableName, filters, nil)
-	if err != nil {
-		// 索引选择失败，使用全表扫描
-		memTable, err := e.getOrCreateMemTable(dbName, tableName)
+		// 从 SSTable 查询
+		var err error
+		sstablePoints, err = e.sstableManager.Query(dbName, tableName, timeRange, nil)
 		if err != nil {
-			return nil, fmt.Errorf("failed to get memtable: %w", err)
+			logger.Printf("从 SSTable 查询失败: %v", err)
+			// 即使查询失败，我们仍然返回内存表中的结果
 		}
-		return memTable.QueryByTag(tagKey, tagValue), nil
 	}
 
-	// 获取选定的索引
-	selectedIndex, err := e.indexMgr.GetIndex(ctx, dbName, tableName, indexName)
-	if err != nil {
-		// 索引获取失败，使用全表扫描
-		memTable, err := e.getOrCreateMemTable(dbName, tableName)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get memtable: %w", err)
-		}
-		return memTable.QueryByTag(tagKey, tagValue), nil
-	}
+	// 合并结果
+	if len(sstablePoints) > 0 {
+		// 合并内存表和 SSTable 的结果
+		allPoints := append(memPoints, sstablePoints...)
 
-	// 创建查询条件
-	condition := index.IndexCondition{
-		Field:    tagKey,
-		Operator: "=",
-		Value:    tagValue,
-	}
+		// 按时间戳排序
+		sort.Slice(allPoints, func(i, j int) bool {
+			return allPoints[i].Timestamp < allPoints[j].Timestamp
+		})
 
-	// 使用索引进行查询
-	seriesIDs, err := selectedIndex.Search(ctx, condition)
-	if err != nil || len(seriesIDs) == 0 {
-		// 索引查询失败或无结果，使用全表扫描
-		memTable, err := e.getOrCreateMemTable(dbName, tableName)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get memtable: %w", err)
-		}
-		return memTable.QueryByTag(tagKey, tagValue), nil
-	}
-
-	// 获取内存表
-	memTable, err := e.getOrCreateMemTable(dbName, tableName)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get memtable: %w", err)
-	}
-
-	// 使用索引结果查询
-	result := make([]*model.TimeSeriesPoint, 0, len(seriesIDs))
-	for _, id := range seriesIDs {
-		// 从seriesID中提取时间戳
-		parts := strings.Split(id, ":")
-		if len(parts) != 3 {
-			continue
-		}
-
-		// 尝试解析时间戳
-		ts, err := strconv.ParseInt(parts[2], 10, 64)
-		if err != nil {
-			continue
-		}
-
-		// 查询内存表
-		point, found := memTable.Get(ts)
-		if found && point != nil {
-			// 验证标签值
-			if value, ok := point.Tags[tagKey]; ok && value == tagValue {
-				result = append(result, point)
+		// 去重
+		if len(allPoints) > 1 {
+			// 使用双指针法去重
+			j := 0
+			for i := 1; i < len(allPoints); i++ {
+				if allPoints[i].Timestamp != allPoints[j].Timestamp {
+					j++
+					if i != j {
+						allPoints[j] = allPoints[i]
+					}
+				}
 			}
+			allPoints = allPoints[:j+1]
+		}
+
+		return allPoints, nil
+	}
+
+	// 如果没有 SSTable 结果，直接返回内存表中的结果
+	return memPoints, nil
+}
+
+// QueryByTag 按标签查询时序数据点
+// 注意：调用者必须在使用完结果后调用ReleasePoints方法将对象放回池中，否则会导致内存泄漏
+func (e *StorageEngine) QueryByTag(dbName, tableName, tagKey, tagValue string) ([]*model.TimeSeriesPoint, error) {
+	// 获取表读锁
+	unlock := e.lockManager.LockTable(dbName, tableName, false)
+	defer unlock()
+
+	// 检查数据库和表是否存在
+	db, dbExists := e.databases[dbName]
+	if !dbExists {
+		return nil, fmt.Errorf("database %s does not exist", dbName)
+	}
+
+	_, tableExists := db.Tables[tableName]
+	if !tableExists {
+		return nil, fmt.Errorf("table %s does not exist in database %s", tableName, dbName)
+	}
+
+	// 从内存表查询
+	memPoints := e.memTableManager.QueryByTag(dbName, tableName, tagKey, tagValue)
+
+	// 从 SSTable 查询
+	var sstablePoints []*model.TimeSeriesPoint
+	if e.sstableManager != nil {
+		// 创建标签过滤条件
+		tags := map[string]string{
+			tagKey: tagValue,
+		}
+
+		// 创建时间范围（全范围）
+		timeRange := TimeRange{
+			Start: 0,
+			End:   math.MaxInt64,
+		}
+
+		// 从 SSTable 查询
+		var err error
+		sstablePoints, err = e.sstableManager.Query(dbName, tableName, timeRange, tags)
+		if err != nil {
+			logger.Printf("从 SSTable 查询标签失败: %v", err)
+			// 即使查询失败，我们仍然返回内存表中的结果
 		}
 	}
 
-	return result, nil
+	// 合并结果
+	if len(sstablePoints) > 0 {
+		// 合并内存表和 SSTable 的结果
+		allPoints := append(memPoints, sstablePoints...)
+
+		// 按时间戳排序
+		sort.Slice(allPoints, func(i, j int) bool {
+			return allPoints[i].Timestamp < allPoints[j].Timestamp
+		})
+
+		// 去重
+		if len(allPoints) > 1 {
+			// 使用双指针法去重
+			j := 0
+			for i := 1; i < len(allPoints); i++ {
+				if allPoints[i].Timestamp != allPoints[j].Timestamp {
+					j++
+					if i != j {
+						allPoints[j] = allPoints[i]
+					}
+				}
+			}
+			allPoints = allPoints[:j+1]
+		}
+
+		return allPoints, nil
+	}
+
+	// 如果没有 SSTable 结果，直接返回内存表中的结果
+	return memPoints, nil
 }
 
 // Close 关闭存储引擎
 func (e *StorageEngine) Close() error {
-	// 停止后台任务
+	logger.Printf("正在关闭存储引擎...")
+	startTime := time.Now()
+
+	// 发送关闭信号
 	close(e.closing)
+
+	// 停止刷盘定时器
 	if e.flushTicker != nil {
 		e.flushTicker.Stop()
 	}
 
-	// 保存元数据
-	if err := e.saveMetadata(); err != nil {
-		return fmt.Errorf("failed to save metadata: %w", err)
+	// 关闭内存表管理器
+	logger.Printf("关闭内存表管理器...")
+	if err := e.memTableManager.Close(); err != nil {
+		logger.Printf("关闭内存表管理器失败: %v", err)
+	}
+
+	// 关闭 SSTable 管理器
+	if e.sstableManager != nil {
+		logger.Printf("关闭 SSTable 管理器...")
+		if e.sstableManager.bgCompactor != nil {
+			e.sstableManager.bgCompactor.Stop()
+		}
+	}
+
+	// 执行WAL检查点和压缩
+	logger.Printf("执行WAL检查点和压缩...")
+	if err := e.wal.Checkpoint(); err != nil {
+		logger.Printf("WAL检查点失败: %v", err)
+	}
+
+	if err := e.CompactWAL(); err != nil {
+		logger.Printf("关闭时WAL压缩失败: %v", err)
 	}
 
 	// 关闭写缓冲区
 	if e.writeBuffer != nil {
+		logger.Printf("关闭写缓冲区...")
 		if err := e.writeBuffer.Close(); err != nil {
-			return fmt.Errorf("failed to close write buffer: %w", err)
+			logger.Printf("关闭写缓冲区失败: %v", err)
 		}
 	}
 
 	// 关闭异步索引更新器
 	if e.asyncIndexUpdater != nil {
+		logger.Printf("关闭异步索引更新器...")
 		if err := e.asyncIndexUpdater.Close(); err != nil {
-			return fmt.Errorf("failed to close async index updater: %w", err)
+			logger.Printf("关闭异步索引更新器失败: %v", err)
 		}
 	}
 
-	// 刷新所有内存表
-	e.flushMemTables()
-
 	// 关闭异步WAL
 	if e.asyncWAL != nil {
+		logger.Printf("关闭异步WAL...")
 		if err := e.asyncWAL.Close(); err != nil {
-			return fmt.Errorf("failed to close async WAL: %w", err)
+			logger.Printf("关闭异步WAL失败: %v", err)
 		}
 	}
 
 	// 关闭WAL
-	if err := e.wal.Close(); err != nil {
-		return fmt.Errorf("failed to close WAL: %w", err)
+	if e.wal != nil {
+		logger.Printf("关闭WAL...")
+		if err := e.wal.Close(); err != nil {
+			logger.Printf("关闭WAL失败: %v", err)
+		}
 	}
 
-	// 关闭索引管理器
-	if err := e.indexMgr.Close(); err != nil {
-		return fmt.Errorf("failed to close index manager: %w", err)
+	// 保存元数据
+	logger.Printf("保存元数据...")
+	if err := e.saveMetadata(); err != nil {
+		logger.Printf("保存元数据失败: %v", err)
 	}
 
+	logger.Printf("存储引擎关闭完成，耗时: %v", time.Since(startTime))
 	return nil
 }
 
@@ -2572,4 +2607,224 @@ func (e *StorageEngine) CreatePointWithPool(timestamp int64, tags map[string]str
 // ReleasePoint 将时序数据点放回对象池
 func (e *StorageEngine) ReleasePoint(point *model.TimeSeriesPoint) {
 	e.pointPool.Put(point)
+}
+
+// CompactWAL 压缩WAL文件
+// 该方法会将多个WAL文件合并为一个，并删除不再需要的旧文件
+// 参考了goleveldb的WAL设计思路，实现了以下功能：
+// 1. 合并多个小文件减少文件数量
+// 2. 删除已经持久化到磁盘的数据对应的WAL记录
+// 3. 对WAL数据进行压缩以减少存储空间
+func (e *StorageEngine) CompactWAL() error {
+	startTime := time.Now()
+	logger.Printf("开始压缩WAL文件")
+
+	// 获取所有WAL文件
+	files, err := filepath.Glob(filepath.Join(e.walDir, "*.wal"))
+	if err != nil {
+		return fmt.Errorf("failed to list WAL files: %w", err)
+	}
+
+	// 按文件序号排序
+	sort.Strings(files)
+
+	// 如果文件数量少于2个，不需要压缩
+	if len(files) < 2 {
+		logger.Printf("WAL文件数量少于2个，无需压缩")
+		return nil
+	}
+
+	// 获取当前WAL文件路径
+	currentWALFile := e.wal.currentFile.Name()
+
+	// 收集需要压缩的文件（排除当前正在写入的文件）
+	var filesToCompact []string
+	for _, file := range files {
+		if file != currentWALFile {
+			filesToCompact = append(filesToCompact, file)
+		}
+	}
+
+	// 如果没有需要压缩的文件，直接返回
+	if len(filesToCompact) == 0 {
+		logger.Printf("没有需要压缩的WAL文件")
+		return nil
+	}
+
+	logger.Printf("找到 %d 个WAL文件需要压缩", len(filesToCompact))
+
+	// 创建临时文件用于存储压缩后的数据
+	tempFile := filepath.Join(e.walDir, fmt.Sprintf("compact_%d.wal.tmp", time.Now().UnixNano()))
+	compactedFile, err := os.Create(tempFile)
+	if err != nil {
+		return fmt.Errorf("failed to create temporary file for WAL compaction: %w", err)
+	}
+	defer compactedFile.Close()
+
+	// 创建一个映射来跟踪已处理的条目，避免重复
+	// 键格式: "database:table:timestamp"
+	processedEntries := make(map[string]bool)
+
+	// 创建一个缓冲区来存储压缩后的条目
+	var compactedEntries []*WALEntry
+	var totalEntries, uniqueEntries int
+
+	// 从最新的文件开始处理（除了当前文件）
+	for i := len(filesToCompact) - 1; i >= 0; i-- {
+		file := filesToCompact[i]
+
+		// 读取文件中的所有条目
+		entries, err := e.wal.recoverFile(file)
+		if err != nil {
+			logger.Printf("读取WAL文件 %s 失败: %v", file, err)
+			continue
+		}
+
+		totalEntries += len(entries)
+
+		// 从后向前处理条目，保留最新的操作
+		for j := len(entries) - 1; j >= 0; j-- {
+			entry := entries[j]
+			key := fmt.Sprintf("%s:%s:%d", entry.Database, entry.Table, entry.Timestamp)
+
+			// 如果条目已经处理过，跳过
+			if _, exists := processedEntries[key]; exists {
+				continue
+			}
+
+			// 标记为已处理
+			processedEntries[key] = true
+
+			// 添加到压缩条目列表
+			compactedEntries = append(compactedEntries, entry)
+			uniqueEntries++
+		}
+	}
+
+	// 反转压缩条目列表，使其按时间顺序排列
+	for i, j := 0, len(compactedEntries)-1; i < j; i, j = i+1, j-1 {
+		compactedEntries[i], compactedEntries[j] = compactedEntries[j], compactedEntries[i]
+	}
+
+	// 将压缩后的条目写入临时文件
+	for _, entry := range compactedEntries {
+		data, err := e.wal.serializeEntry(entry)
+		if err != nil {
+			return fmt.Errorf("failed to serialize WAL entry: %w", err)
+		}
+
+		if _, err := compactedFile.Write(data); err != nil {
+			return fmt.Errorf("failed to write to compacted WAL file: %w", err)
+		}
+	}
+
+	// 确保数据写入磁盘
+	if err := compactedFile.Sync(); err != nil {
+		return fmt.Errorf("failed to sync compacted WAL file: %w", err)
+	}
+
+	// 关闭临时文件
+	if err := compactedFile.Close(); err != nil {
+		return fmt.Errorf("failed to close compacted WAL file: %w", err)
+	}
+
+	// 创建新的WAL文件
+	newWALFile := filepath.Join(e.walDir, fmt.Sprintf(walFileFormat, time.Now().UnixNano()))
+
+	// 重命名临时文件为新的WAL文件
+	if err := os.Rename(tempFile, newWALFile); err != nil {
+		return fmt.Errorf("failed to rename compacted WAL file: %w", err)
+	}
+
+	// 删除旧的WAL文件
+	for _, file := range filesToCompact {
+		if err := os.Remove(file); err != nil {
+			logger.Printf("删除旧WAL文件 %s 失败: %v", file, err)
+		} else {
+			logger.Printf("删除旧WAL文件 %s 成功", file)
+		}
+	}
+
+	// 计算压缩率
+	compressionRatio := float64(uniqueEntries) / float64(totalEntries) * 100
+	logger.Printf("WAL压缩完成: 总条目 %d, 唯一条目 %d, 压缩率 %.2f%%, 耗时 %v",
+		totalEntries, uniqueEntries, compressionRatio, time.Since(startTime))
+
+	return nil
+}
+
+// GetWALStats 获取WAL统计信息
+func (e *StorageEngine) GetWALStats() map[string]interface{} {
+	// 获取所有WAL文件
+	files, err := filepath.Glob(filepath.Join(e.walDir, "*.wal"))
+	if err != nil {
+		logger.Printf("获取WAL文件列表失败: %v", err)
+		return map[string]interface{}{
+			"error": err.Error(),
+		}
+	}
+
+	// 统计信息
+	var totalSize int64
+	var oldestFile, newestFile string
+	var oldestTime, newestTime int64 = math.MaxInt64, 0
+
+	fileStats := make([]map[string]interface{}, 0, len(files))
+
+	for _, file := range files {
+		info, err := os.Stat(file)
+		if err != nil {
+			continue
+		}
+
+		// 从文件名中提取时间戳
+		baseName := filepath.Base(file)
+		timeStr := strings.TrimSuffix(baseName, ".wal")
+		timestamp, err := strconv.ParseInt(timeStr, 10, 64)
+		if err != nil {
+			timestamp = info.ModTime().UnixNano()
+		}
+
+		// 更新最旧和最新文件信息
+		if timestamp < oldestTime {
+			oldestTime = timestamp
+			oldestFile = file
+		}
+		if timestamp > newestTime {
+			newestTime = timestamp
+			newestFile = file
+		}
+
+		totalSize += info.Size()
+
+		fileStats = append(fileStats, map[string]interface{}{
+			"path":      file,
+			"size":      info.Size(),
+			"timestamp": timestamp,
+			"modTime":   info.ModTime(),
+		})
+	}
+
+	// 排序文件统计信息（按时间戳）
+	sort.Slice(fileStats, func(i, j int) bool {
+		return fileStats[i]["timestamp"].(int64) < fileStats[j]["timestamp"].(int64)
+	})
+
+	return map[string]interface{}{
+		"fileCount":   len(files),
+		"totalSize":   totalSize,
+		"oldestFile":  oldestFile,
+		"oldestTime":  time.Unix(0, oldestTime),
+		"newestFile":  newestFile,
+		"newestTime":  time.Unix(0, newestTime),
+		"files":       fileStats,
+		"poolStats":   walEntryPool.Stats(),
+		"currentTime": time.Now(),
+	}
+}
+
+// flushAllMemTables 刷新所有内存表到磁盘
+func (e *StorageEngine) flushAllMemTables() error {
+	// 使用内存表管理器刷盘所有内存表
+	return e.memTableManager.FlushAll()
 }

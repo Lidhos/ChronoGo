@@ -2,6 +2,7 @@ package model
 
 import (
 	"fmt"
+	"strconv"
 	"sync"
 	"time"
 
@@ -113,7 +114,7 @@ func (p *TimeSeriesPoint) ToBSON() bson.D {
 
 // FromBSON 从BSON文档创建时序数据点
 func FromBSON(doc bson.D) (*TimeSeriesPoint, error) {
-	// 从对象池获取一个TimeSeriesPoint
+	// 从全局对象池获取一个TimeSeriesPoint
 	point := globalPointPool.Get()
 
 	// 解析BSON文档
@@ -130,6 +131,41 @@ func FromBSON(doc bson.D) (*TimeSeriesPoint, error) {
 				point.Timestamp = int64(v)
 			case time.Time:
 				point.Timestamp = v.UnixNano()
+			case string:
+				// 尝试将字符串解析为时间戳
+				// 首先尝试解析为整数
+				if ts, err := strconv.ParseInt(v, 10, 64); err == nil {
+					point.Timestamp = ts
+				} else {
+					// 尝试解析为RFC3339格式的时间
+					if t, err := time.Parse(time.RFC3339, v); err == nil {
+						point.Timestamp = t.UnixNano()
+					} else if t, err := time.Parse(time.RFC3339Nano, v); err == nil {
+						point.Timestamp = t.UnixNano()
+					} else {
+						// 尝试其他常见时间格式
+						formats := []string{
+							"2006-01-02 15:04:05",
+							"2006-01-02T15:04:05",
+							"2006/01/02 15:04:05",
+							"01/02/2006 15:04:05",
+							"02/01/2006 15:04:05",
+						}
+						parsed := false
+						for _, format := range formats {
+							if t, err := time.Parse(format, v); err == nil {
+								point.Timestamp = t.UnixNano()
+								parsed = true
+								break
+							}
+						}
+						if !parsed {
+							// 发生错误时，将对象放回池中
+							globalPointPool.Put(point)
+							return nil, fmt.Errorf("unsupported timestamp string format: %s", v)
+						}
+					}
+				}
 			default:
 				// 发生错误时，将对象放回池中
 				globalPointPool.Put(point)
@@ -193,6 +229,41 @@ func FromBSONWithPool(doc bson.D, pool *TimeSeriesPointPool) (*TimeSeriesPoint, 
 				point.Timestamp = int64(v)
 			case time.Time:
 				point.Timestamp = v.UnixNano()
+			case string:
+				// 尝试将字符串解析为时间戳
+				// 首先尝试解析为整数
+				if ts, err := strconv.ParseInt(v, 10, 64); err == nil {
+					point.Timestamp = ts
+				} else {
+					// 尝试解析为RFC3339格式的时间
+					if t, err := time.Parse(time.RFC3339, v); err == nil {
+						point.Timestamp = t.UnixNano()
+					} else if t, err := time.Parse(time.RFC3339Nano, v); err == nil {
+						point.Timestamp = t.UnixNano()
+					} else {
+						// 尝试其他常见时间格式
+						formats := []string{
+							"2006-01-02 15:04:05",
+							"2006-01-02T15:04:05",
+							"2006/01/02 15:04:05",
+							"01/02/2006 15:04:05",
+							"02/01/2006 15:04:05",
+						}
+						parsed := false
+						for _, format := range formats {
+							if t, err := time.Parse(format, v); err == nil {
+								point.Timestamp = t.UnixNano()
+								parsed = true
+								break
+							}
+						}
+						if !parsed {
+							// 发生错误时，将对象放回池中
+							pool.Put(point)
+							return nil, fmt.Errorf("unsupported timestamp string format: %s", v)
+						}
+					}
+				}
 			default:
 				// 发生错误时，将对象放回池中
 				pool.Put(point)
