@@ -119,19 +119,6 @@ func (e *QueryEngine) evictCacheIfNeeded() {
 }
 
 // cleanExpiredCache 清理过期缓存
-func (e *QueryEngine) cleanExpiredCache() {
-	e.cacheMu.Lock()
-	defer e.cacheMu.Unlock()
-
-	now := time.Now()
-	for k, v := range e.queryCache {
-		if now.Sub(v.Timestamp) > e.cacheTTL {
-			delete(e.queryCache, k)
-		}
-	}
-}
-
-// getCacheKey 获取查询缓存键
 func (e *QueryEngine) getCacheKey(query *Query) string {
 	// 将查询转换为字符串作为缓存键
 	data, _ := json.Marshal(query)

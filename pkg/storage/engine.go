@@ -21,6 +21,7 @@ import (
 	"ChronoGo/pkg/index"
 	"ChronoGo/pkg/logger"
 	"ChronoGo/pkg/model"
+	"ChronoGo/pkg/util"
 )
 
 // StorageEngine 表示时序存储引擎
@@ -2074,6 +2075,15 @@ func (e *StorageEngine) compressData(data []byte) ([]byte, error) {
 
 // copyFile 复制文件
 func (e *StorageEngine) copyFile(src, dst string) error {
+	// 尝试使用零拷贝技术
+	err := util.CopyFileWithSendfile(src, dst)
+	if err == nil {
+		return nil
+	}
+
+	// 如果零拷贝失败，回退到标准复制
+	logger.Printf("Sendfile failed, falling back to standard copy: %v", err)
+
 	sourceFile, err := os.Open(src)
 	if err != nil {
 		return fmt.Errorf("failed to open source file: %w", err)

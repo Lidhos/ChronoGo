@@ -432,3 +432,55 @@ func (m *IndexManagerImpl) Close() error {
 
 	return nil
 }
+
+// FlushAll 刷新所有索引
+func (m *IndexManagerImpl) FlushAll(ctx context.Context) error {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	// 检查上下文是否已取消
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
+	// 遍历所有索引并刷新
+	for _, db := range m.indexes {
+		for _, coll := range db {
+			for _, idx := range coll {
+				if err := idx.Flush(ctx); err != nil {
+					return fmt.Errorf("failed to flush index %s: %w", idx.Name(), err)
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+// CompactAll 压缩所有索引
+func (m *IndexManagerImpl) CompactAll(ctx context.Context) error {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	// 检查上下文是否已取消
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
+	// 遍历所有索引并压缩
+	for _, db := range m.indexes {
+		for _, coll := range db {
+			for _, idx := range coll {
+				if err := idx.Compact(ctx); err != nil {
+					return fmt.Errorf("failed to compact index %s: %w", idx.Name(), err)
+				}
+			}
+		}
+	}
+
+	return nil
+}

@@ -353,3 +353,21 @@ func (idx *CompositeIndex) Close() error {
 
 	return nil
 }
+
+// Compact 手动触发压缩（仅LSM树索引支持）
+func (idx *CompositeIndex) Compact(ctx context.Context) error {
+	// 组合索引不支持压缩操作
+	return nil
+}
+
+// Snapshot 创建索引快照（仅LSM树索引支持）
+func (idx *CompositeIndex) Snapshot() (IndexSnapshot, error) {
+	// 组合索引不支持快照
+	return nil, fmt.Errorf("snapshot not supported for composite index")
+}
+
+// Flush 将内存中的数据刷新到磁盘（仅LSM树索引支持）
+func (idx *CompositeIndex) Flush(ctx context.Context) error {
+	// 组合索引不支持刷盘操作
+	return nil
+}

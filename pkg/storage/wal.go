@@ -2,6 +2,7 @@ package storage
 
 import (
 	"ChronoGo/pkg/logger"
+	"ChronoGo/pkg/util"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -45,6 +46,8 @@ type WAL struct {
 	syncInterval time.Duration // 同步间隔
 	lastSync     time.Time     // 上次同步时间
 	entryPool    *WALEntryPool // WAL条目对象池
+	useDirectIO  bool          // 是否使用DirectIO
+	alignedBuf   []byte        // 对齐的缓冲区，用于DirectIO
 }
 
 // 全局WALEntry对象池
@@ -61,12 +64,23 @@ func NewWAL(dir string, maxFileSize int64) (*WAL, error) {
 		maxFileSize = defaultMaxWALFileSize
 	}
 
+	// 检查是否支持DirectIO
+	useDirectIO := true
+
+	// 创建对齐的缓冲区，用于DirectIO
+	var alignedBuf []byte
+	if useDirectIO {
+		alignedBuf = util.AlignedBuffer(64 * 1024) // 64KB对齐缓冲区
+	}
+
 	wal := &WAL{
 		dir:          dir,
 		maxFileSize:  maxFileSize,
 		syncInterval: 200 * time.Millisecond,
 		lastSync:     time.Now(),
 		entryPool:    walEntryPool,
+		useDirectIO:  useDirectIO,
+		alignedBuf:   alignedBuf,
 	}
 
 	// 打开或创建WAL文件
@@ -104,9 +118,24 @@ func (w *WAL) openCurrentFile() error {
 	}
 
 	// 打开文件
-	file, err := os.OpenFile(latestFile, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0644)
-	if err != nil {
-		return fmt.Errorf("failed to open WAL file: %w", err)
+	var file *os.File
+	var openErr error
+
+	if w.useDirectIO {
+		// 使用DirectIO打开文件
+		file, openErr = util.OpenDirectIO(latestFile, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0644)
+		if openErr != nil {
+			// 如果DirectIO失败，回退到标准IO
+			logger.Printf("DirectIO not supported, falling back to standard IO: %v", openErr)
+			w.useDirectIO = false
+			file, openErr = os.OpenFile(latestFile, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0644)
+		}
+	} else {
+		file, openErr = os.OpenFile(latestFile, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0644)
+	}
+
+	if openErr != nil {
+		return fmt.Errorf("failed to open WAL file: %w", openErr)
 	}
 
 	w.currentFile = file
@@ -125,7 +154,15 @@ func (w *WAL) Write(entry *WALEntry) error {
 	}
 
 	// 写入数据
-	n, err := w.currentFile.Write(data)
+	var n int
+	if w.useDirectIO {
+		// 使用DirectIO写入
+		n, err = w.writeWithDirectIO(data)
+	} else {
+		// 使用标准IO写入
+		n, err = w.currentFile.Write(data)
+	}
+
 	if err != nil {
 		return fmt.Errorf("failed to write to WAL file: %w", err)
 	}
@@ -149,6 +186,30 @@ func (w *WAL) Write(entry *WALEntry) error {
 	}
 
 	return nil
+}
+
+// writeWithDirectIO 使用DirectIO写入数据
+func (w *WAL) writeWithDirectIO(data []byte) (int, error) {
+	// 确保数据对齐到扇区大小
+	dataLen := len(data)
+	alignedSize := ((dataLen + util.DefaultSectorSize - 1) / util.DefaultSectorSize) * util.DefaultSectorSize
+
+	// 如果对齐缓冲区不够大，重新分配
+	if len(w.alignedBuf) < alignedSize {
+		w.alignedBuf = util.AlignedBuffer(alignedSize)
+	}
+
+	// 复制数据到对齐缓冲区
+	copy(w.alignedBuf, data)
+
+	// 使用DirectIO写入
+	_, err := w.currentFile.Write(w.alignedBuf[:alignedSize])
+	if err != nil {
+		return 0, err
+	}
+
+	// 返回实际数据大小
+	return dataLen, nil
 }
 
 // serializeEntry 序列化WAL条目
@@ -200,7 +261,23 @@ func (w *WAL) rotateFile() error {
 
 	// 创建新文件
 	newFile := filepath.Join(w.dir, fmt.Sprintf(walFileFormat, time.Now().UnixNano()))
-	file, err := os.OpenFile(newFile, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0644)
+
+	var file *os.File
+	var err error
+
+	if w.useDirectIO {
+		// 使用DirectIO打开文件
+		file, err = util.OpenDirectIO(newFile, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0644)
+		if err != nil {
+			// 如果DirectIO失败，回退到标准IO
+			logger.Printf("DirectIO not supported for new file, falling back to standard IO: %v", err)
+			w.useDirectIO = false
+			file, err = os.OpenFile(newFile, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0644)
+		}
+	} else {
+		file, err = os.OpenFile(newFile, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0644)
+	}
+
 	if err != nil {
 		return fmt.Errorf("failed to create new WAL file: %w", err)
 	}

@@ -18,6 +18,8 @@ const (
 	IndexTypeHash IndexType = 4
 	// IndexTypeComposite 复合索引
 	IndexTypeComposite IndexType = 5
+	// IndexTypeLSM LSM树索引
+	IndexTypeLSM IndexType = 6
 )
 
 // IndexOptions 索引选项
@@ -38,6 +40,28 @@ type IndexOptions struct {
 	SupportPrefix bool
 	// 是否支持正则表达式
 	SupportRegex bool
+	// LSM树索引特有选项
+	LSMOptions *LSMIndexOptions
+}
+
+// LSMIndexOptions LSM树索引特有选项
+type LSMIndexOptions struct {
+	// MemTable大小限制（字节）
+	MemTableSizeLimit int64
+	// 布隆过滤器误判率
+	BloomFilterFPRate float64
+	// 是否启用前缀压缩
+	EnablePrefixCompression bool
+	// 缓存大小（字节）
+	CacheSize int64
+	// 合并策略（tiered, leveled, hybrid）
+	CompactionStrategy string
+	// 写缓冲区大小
+	WriteBufferSize int
+	// 是否启用WAL
+	EnableWAL bool
+	// 是否启用快照
+	EnableSnapshot bool
 }
 
 // IndexStats 索引统计信息
@@ -58,6 +82,26 @@ type IndexStats struct {
 	AvgQueryTimeNs int64
 	// 最后更新时间
 	LastUpdateTime int64
+	// LSM树索引特有统计信息
+	LSMStats *LSMIndexStats
+}
+
+// LSMIndexStats LSM树索引特有统计信息
+type LSMIndexStats struct {
+	// MemTable大小（字节）
+	MemTableSize int64
+	// SSTable文件数量
+	SSTableCount int
+	// 各层级SSTable数量
+	LevelSSTables []int
+	// 压缩次数
+	CompactionCount int64
+	// 最后压缩时间
+	LastCompactionTime int64
+	// 布隆过滤器命中率
+	BloomFilterHitRate float64
+	// 缓存命中率
+	CacheHitRate float64
 }
 
 // IndexCondition 索引查询条件
@@ -104,6 +148,27 @@ type Index interface {
 
 	// Close 关闭索引
 	Close() error
+
+	// Snapshot 创建索引快照（仅LSM树索引支持）
+	Snapshot() (IndexSnapshot, error)
+
+	// Flush 将内存中的数据刷新到磁盘（仅LSM树索引支持）
+	Flush(ctx context.Context) error
+
+	// Compact 手动触发压缩（仅LSM树索引支持）
+	Compact(ctx context.Context) error
+}
+
+// IndexSnapshot 索引快照接口
+type IndexSnapshot interface {
+	// Search 在快照中搜索
+	Search(ctx context.Context, condition IndexCondition) ([]string, error)
+
+	// SearchRange 在快照中范围搜索
+	SearchRange(ctx context.Context, startKey, endKey interface{}, includeStart, includeEnd bool) ([]string, error)
+
+	// Release 释放快照资源
+	Release() error
 }
 
 // IndexManager 索引管理器接口
@@ -131,6 +196,12 @@ type IndexManager interface {
 
 	// Close 关闭索引管理器
 	Close() error
+
+	// FlushAll 刷新所有索引
+	FlushAll(ctx context.Context) error
+
+	// CompactAll 压缩所有索引
+	CompactAll(ctx context.Context) error
 }
 
 // SeriesID 表示时间序列ID

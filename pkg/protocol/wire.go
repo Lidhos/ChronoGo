@@ -1018,15 +1018,6 @@ func splitNamespace(namespace string) []string {
 }
 
 // getBsonValue 从BSON文档中获取值
-func getBsonValue(doc bson.D, key string) (interface{}, error) {
-	for _, elem := range doc {
-		if elem.Key == key {
-			return elem.Value, nil
-		}
-	}
-	return nil, fmt.Errorf("key not found: %s", key)
-}
-
 // sendReply 发送响应
 func (h *WireProtocolHandler) sendReply(session *Session, responseTo int32, documents []bson.D, flags int32, cursorID int64) error {
 	logger.Printf("sendReply: 开始发送响应 (ResponseTo: %d, 文档数: %d, 标志位: %d, 游标ID: %d)",

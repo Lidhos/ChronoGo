@@ -515,3 +515,21 @@ func max(a, b int) int {
 	}
 	return b
 }
+
+// Compact 手动触发压缩（仅LSM树索引支持）
+func (idx *BitmapIndex) Compact(ctx context.Context) error {
+	// 位图索引不支持压缩操作
+	return nil
+}
+
+// Snapshot 创建索引快照（仅LSM树索引支持）
+func (idx *BitmapIndex) Snapshot() (IndexSnapshot, error) {
+	// 位图索引不支持快照
+	return nil, fmt.Errorf("snapshot not supported for bitmap index")
+}
+
+// Flush 将内存中的数据刷新到磁盘（仅LSM树索引支持）
+func (idx *BitmapIndex) Flush(ctx context.Context) error {
+	// 位图索引不支持刷盘操作
+	return nil
+}

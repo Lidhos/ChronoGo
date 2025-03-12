@@ -21,6 +21,7 @@ import (
 
 	"ChronoGo/pkg/logger"
 	"ChronoGo/pkg/model"
+	"ChronoGo/pkg/util"
 )
 
 const (
@@ -168,6 +169,7 @@ type SSTableReader struct {
 type SSTableWriter struct {
 	file                *os.File                      // 文件句柄
 	writer              *bufio.Writer                 // 缓冲写入器
+	mmapFile            *util.MmapFile                // 内存映射文件
 	dataBlocks          [][]byte                      // 数据块列表
 	indexEntries        []indexEntry                  // 索引条目列表
 	currentBlock        *bytes.Buffer                 // 当前数据块
@@ -181,6 +183,8 @@ type SSTableWriter struct {
 	maxKey              int64                         // 最大键 (时间戳)
 	keyCount            int64                         // 键数量 - 修改为int64类型
 	tagMeta             map[string]map[string][]int64 // 标签元数据
+	currentOffset       int64                         // 当前写入偏移量
+	useZeroCopy         bool                          // 是否使用零拷贝
 }
 
 // indexEntry 表示索引条目
@@ -421,7 +425,7 @@ func (m *SSTableManager) CreateSSTableFromMemTable(memTable *MemTable, dbName, t
 	fileName := fmt.Sprintf(sstableFileFormat, dbName, tableName, 0, fileID, sstableFileExt)
 	filePath := filepath.Join(m.dataDir, fileName)
 
-	// 创建 SSTable 写入器
+	// 创建 SSTable 写入器 - 使用零拷贝优化
 	writer, err := NewSSTableWriter(filePath, dbName, tableName, 0, m.options)
 	if err != nil {
 		return "", fmt.Errorf("failed to create SSTable writer: %w", err)
@@ -1562,19 +1566,24 @@ func NewSSTableWriter(filePath string, dbName, tableName string, level int, opti
 		return nil, fmt.Errorf("failed to create SSTable file: %w", err)
 	}
 
+	// 检查是否支持零拷贝
+	useZeroCopy := true
+
 	writer := &SSTableWriter{
-		file:         file,
-		writer:       bufio.NewWriterSize(file, 64*1024), // 64KB 缓冲区
-		dataBlocks:   make([][]byte, 0),
-		currentBlock: bytes.NewBuffer(make([]byte, 0, options.DataBlockSize)),
-		options:      options,
-		dbName:       dbName,
-		tableName:    tableName,
-		level:        level,
-		minKey:       math.MaxInt64,
-		maxKey:       math.MinInt64,
-		keyCount:     0, // 修改为int64类型
-		tagMeta:      make(map[string]map[string][]int64),
+		file:          file,
+		writer:        bufio.NewWriterSize(file, 64*1024), // 64KB 缓冲区
+		dataBlocks:    make([][]byte, 0),
+		currentBlock:  bytes.NewBuffer(make([]byte, 0, options.DataBlockSize)),
+		options:       options,
+		dbName:        dbName,
+		tableName:     tableName,
+		level:         level,
+		minKey:        math.MaxInt64,
+		maxKey:        math.MinInt64,
+		keyCount:      0, // 修改为int64类型
+		tagMeta:       make(map[string]map[string][]int64),
+		currentOffset: 0,
+		useZeroCopy:   useZeroCopy,
 	}
 
 	// 写入文件头
@@ -1583,14 +1592,74 @@ func NewSSTableWriter(filePath string, dbName, tableName string, level int, opti
 		file.Close()
 		return nil, fmt.Errorf("failed to write file header: %w", err)
 	}
+	writer.currentOffset += int64(len(header))
 
 	// 写入格式版本
-	if err := binary.Write(writer.writer, binary.LittleEndian, uint32(sstableFormatVersion)); err != nil {
+	versionBytes := make([]byte, 4)
+	binary.LittleEndian.PutUint32(versionBytes, uint32(sstableFormatVersion))
+	if _, err := writer.writer.Write(versionBytes); err != nil {
 		file.Close()
 		return nil, fmt.Errorf("failed to write format version: %w", err)
 	}
+	writer.currentOffset += 4
+
+	// 如果使用零拷贝，刷新缓冲区并创建内存映射
+	if useZeroCopy {
+		// 刷新已写入的数据
+		if err := writer.writer.Flush(); err != nil {
+			file.Close()
+			return nil, fmt.Errorf("failed to flush writer: %w", err)
+		}
+
+		// 关闭文件，重新以内存映射方式打开
+		fileName := file.Name()
+		file.Close()
+
+		// 预估文件大小 (根据数据量估算，这里使用一个较大的初始值)
+		estimatedSize := int64(10 * 1024 * 1024) // 10MB
+
+		// 创建内存映射文件
+		mmapFile, err := util.NewMmapFile(fileName, estimatedSize, true)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create mmap file: %w", err)
+		}
+
+		writer.mmapFile = mmapFile
+		writer.file = nil   // 不再使用标准文件句柄
+		writer.writer = nil // 不再使用缓冲写入器
+	}
 
 	return writer, nil
+}
+
+// writeToFile 写入数据到文件
+func (w *SSTableWriter) writeToFile(data []byte) error {
+	if w.useZeroCopy && w.mmapFile != nil {
+		// 检查是否需要扩展映射文件大小
+		if w.currentOffset+int64(len(data)) > w.mmapFile.Size() {
+			newSize := (w.currentOffset + int64(len(data))) * 2 // 扩展为当前需要的两倍
+			if err := w.mmapFile.Resize(newSize); err != nil {
+				return fmt.Errorf("failed to resize mmap file: %w", err)
+			}
+		}
+
+		// 使用内存映射写入
+		if err := w.mmapFile.Write(w.currentOffset, data); err != nil {
+			return fmt.Errorf("failed to write to mmap file: %w", err)
+		}
+
+		w.currentOffset += int64(len(data))
+		return nil
+	} else {
+		// 使用标准写入
+		n, err := w.writer.Write(data)
+		if err != nil {
+			return fmt.Errorf("failed to write data: %w", err)
+		}
+
+		w.currentOffset += int64(n)
+		return nil
+	}
 }
 
 // Add 添加数据点
@@ -1689,18 +1758,22 @@ func (w *SSTableWriter) flushCurrentBlock() error {
 	}
 
 	// 获取当前位置作为块偏移量
-	blockOffset, err := w.file.Seek(0, io.SeekCurrent)
-	if err != nil {
-		return fmt.Errorf("failed to get current position: %w", err)
-	}
+	blockOffset := w.currentOffset
 
 	// 写入块头
-	if err := binary.Write(w.writer, binary.LittleEndian, header); err != nil {
+	headerBytes := make([]byte, 14) // 块头大小: 1+1+4+4+4 = 14字节
+	headerBytes[0] = header.Type
+	headerBytes[1] = header.CompressionType
+	binary.LittleEndian.PutUint32(headerBytes[2:6], header.UncompressedSize)
+	binary.LittleEndian.PutUint32(headerBytes[6:10], header.CompressedSize)
+	binary.LittleEndian.PutUint32(headerBytes[10:14], header.EntryCount)
+
+	if err := w.writeToFile(headerBytes); err != nil {
 		return fmt.Errorf("failed to write block header: %w", err)
 	}
 
 	// 写入压缩后的块数据
-	if _, err := w.writer.Write(compressedData); err != nil {
+	if err := w.writeToFile(compressedData); err != nil {
 		return fmt.Errorf("failed to write block data: %w", err)
 	}
 
@@ -1708,7 +1781,7 @@ func (w *SSTableWriter) flushCurrentBlock() error {
 	w.indexEntries = append(w.indexEntries, indexEntry{
 		Key:         w.lastKey,
 		BlockOffset: blockOffset,
-		BlockSize:   binary.Size(header) + len(compressedData),
+		BlockSize:   len(headerBytes) + len(compressedData),
 	})
 
 	// 重置当前块
@@ -2088,66 +2161,112 @@ func (w *SSTableWriter) Finish() (*SSTableInfo, error) {
 		return nil, fmt.Errorf("failed to write footer: %w", err)
 	}
 
-	// 刷新缓冲区
-	if err := w.writer.Flush(); err != nil {
-		return nil, fmt.Errorf("failed to flush writer: %w", err)
-	}
-
-	// 同步文件
-	if err := w.file.Sync(); err != nil {
-		return nil, fmt.Errorf("failed to sync file: %w", err)
-	}
-
-	// 获取文件大小
-	fileInfo, err := w.file.Stat()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get file info: %w", err)
-	}
-
-	// 提取标签元数据
-	tagMeta := make([]TagMeta, 0, len(w.tagMeta))
-	for tagKey, valueMap := range w.tagMeta {
-		values := make([]string, 0, len(valueMap))
-		for value := range valueMap {
-			values = append(values, value)
+	// 同步到磁盘
+	if w.useZeroCopy && w.mmapFile != nil {
+		// 使用内存映射同步
+		if err := w.mmapFile.Sync(); err != nil {
+			return nil, fmt.Errorf("failed to sync mmap file: %w", err)
 		}
 
-		tagMeta = append(tagMeta, TagMeta{
-			Key:    tagKey,
-			Values: values,
-		})
-	}
+		// 获取文件大小
+		fileSize := w.mmapFile.Size()
 
-	// 创建 SSTable 信息
-	info := &SSTableInfo{
-		FileName:    filepath.Base(w.file.Name()),
-		DBName:      w.dbName,
-		TableName:   w.tableName,
-		Level:       w.level,
-		TimeRange:   TimeRange{Start: w.minKey, End: w.maxKey},
-		Size:        fileInfo.Size(),
-		KeyCount:    int(w.keyCount), // 转换回int类型
-		CreatedAt:   time.Now(),
-		MinKey:      w.minKey,
-		MaxKey:      w.maxKey,
-		IndexOffset: indexOffset,
-		IndexSize:   indexSize,
-		HasFilter:   filterOffset > 0,
-		TagMeta:     tagMeta,
-	}
+		// 获取文件名
+		fileName := filepath.Base(w.mmapFile.File().Name())
 
-	return info, nil
+		// 关闭内存映射文件
+		if err := w.mmapFile.Close(); err != nil {
+			return nil, fmt.Errorf("failed to close mmap file: %w", err)
+		}
+
+		// 提取标签元数据
+		tagMeta := make([]TagMeta, 0, len(w.tagMeta))
+		for tagKey, valueMap := range w.tagMeta {
+			values := make([]string, 0, len(valueMap))
+			for value := range valueMap {
+				values = append(values, value)
+			}
+
+			tagMeta = append(tagMeta, TagMeta{
+				Key:    tagKey,
+				Values: values,
+			})
+		}
+
+		// 创建 SSTable 信息
+		return &SSTableInfo{
+			FileName:    fileName,
+			DBName:      w.dbName,
+			TableName:   w.tableName,
+			Level:       w.level,
+			TimeRange:   TimeRange{Start: w.minKey, End: w.maxKey},
+			Size:        fileSize,
+			KeyCount:    int(w.keyCount),
+			CreatedAt:   time.Now(),
+			MinKey:      w.minKey,
+			MaxKey:      w.maxKey,
+			IndexOffset: indexOffset,
+			IndexSize:   int(indexSize),
+			HasFilter:   w.options.UseBloomFilter,
+			TagMeta:     tagMeta,
+		}, nil
+	} else {
+		// 使用标准文件操作
+		if err := w.writer.Flush(); err != nil {
+			return nil, fmt.Errorf("failed to flush writer: %w", err)
+		}
+
+		if err := w.file.Sync(); err != nil {
+			return nil, fmt.Errorf("failed to sync file: %w", err)
+		}
+
+		// 获取文件大小
+		fileInfo, err := w.file.Stat()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get file info: %w", err)
+		}
+
+		// 提取标签元数据
+		tagMeta := make([]TagMeta, 0, len(w.tagMeta))
+		for tagKey, valueMap := range w.tagMeta {
+			values := make([]string, 0, len(valueMap))
+			for value := range valueMap {
+				values = append(values, value)
+			}
+
+			tagMeta = append(tagMeta, TagMeta{
+				Key:    tagKey,
+				Values: values,
+			})
+		}
+
+		// 创建 SSTable 信息
+		return &SSTableInfo{
+			FileName:    filepath.Base(w.file.Name()),
+			DBName:      w.dbName,
+			TableName:   w.tableName,
+			Level:       w.level,
+			TimeRange:   TimeRange{Start: w.minKey, End: w.maxKey},
+			Size:        fileInfo.Size(),
+			KeyCount:    int(w.keyCount),
+			CreatedAt:   time.Now(),
+			MinKey:      w.minKey,
+			MaxKey:      w.maxKey,
+			IndexOffset: indexOffset,
+			IndexSize:   int(indexSize),
+			HasFilter:   w.options.UseBloomFilter,
+			TagMeta:     tagMeta,
+		}, nil
+	}
 }
 
 // Close 关闭 SSTable 写入器
 func (w *SSTableWriter) Close() error {
-	if w.file != nil {
-		w.writer.Flush()
-		err := w.file.Close()
-		w.file = nil
-		return err
+	if w.useZeroCopy && w.mmapFile != nil {
+		return w.mmapFile.Close()
+	} else if w.file != nil {
+		return w.file.Close()
 	}
-
 	return nil
 }
 

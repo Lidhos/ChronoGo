@@ -332,3 +332,21 @@ func (idx *HashIndex) Close() error {
 
 	return nil
 }
+
+// Compact 手动触发压缩（仅LSM树索引支持）
+func (idx *HashIndex) Compact(ctx context.Context) error {
+	// 哈希索引不支持压缩操作
+	return nil
+}
+
+// Snapshot 创建索引快照（仅LSM树索引支持）
+func (idx *HashIndex) Snapshot() (IndexSnapshot, error) {
+	// 哈希索引不支持快照
+	return nil, fmt.Errorf("snapshot not supported for hash index")
+}
+
+// Flush 将内存中的数据刷新到磁盘（仅LSM树索引支持）
+func (idx *HashIndex) Flush(ctx context.Context) error {
+	// 哈希索引不支持刷盘操作
+	return nil
+}

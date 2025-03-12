@@ -559,3 +559,21 @@ func (idx *BTreeIndex) Close() error {
 
 	return nil
 }
+
+// Compact 手动触发压缩（仅LSM树索引支持）
+func (idx *BTreeIndex) Compact(ctx context.Context) error {
+	// BTree索引不支持压缩操作
+	return nil
+}
+
+// Snapshot 创建索引快照（仅LSM树索引支持）
+func (idx *BTreeIndex) Snapshot() (IndexSnapshot, error) {
+	// BTree索引不支持快照
+	return nil, fmt.Errorf("snapshot not supported for btree index")
+}
+
+// Flush 将内存中的数据刷新到磁盘（仅LSM树索引支持）
+func (idx *BTreeIndex) Flush(ctx context.Context) error {
+	// BTree索引不支持刷盘操作
+	return nil
+}
