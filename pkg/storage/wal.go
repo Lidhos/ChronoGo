@@ -3,8 +3,10 @@ package storage
 import (
 	"ChronoGo/pkg/logger"
 	"ChronoGo/pkg/util"
+	"bytes"
 	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"os"
 	"path/filepath"
@@ -202,6 +204,11 @@ func (w *WAL) writeWithDirectIO(data []byte) (int, error) {
 	// 复制数据到对齐缓冲区
 	copy(w.alignedBuf, data)
 
+	// 清空未使用的部分，避免垃圾数据
+	for i := dataLen; i < alignedSize; i++ {
+		w.alignedBuf[i] = 0
+	}
+
 	// 使用DirectIO写入
 	_, err := w.currentFile.Write(w.alignedBuf[:alignedSize])
 	if err != nil {
@@ -219,35 +226,42 @@ func (w *WAL) serializeEntry(entry *WALEntry) ([]byte, error) {
 	tableLen := len(entry.Table)
 	dataLen := len(entry.Data)
 
-	// 总大小 = 类型(1) + 数据库名长度(4) + 表名长度(4) + 时间戳(8) + 数据长度(4) + 数据库名 + 表名 + 数据
-	totalLen := 1 + 4 + 4 + 8 + 4 + dbLen + tableLen + dataLen
+	// 总大小 = 魔数(4) + 类型(1) + 数据库名长度(4) + 表名长度(4) + 时间戳(8) + 数据长度(4) + 数据库名 + 表名 + 数据 + CRC校验(4)
+	totalLen := 4 + 1 + 4 + 4 + 8 + 4 + dbLen + tableLen + dataLen + 4
 
 	// 创建缓冲区
 	buf := make([]byte, totalLen)
 
+	// 写入魔数 "CWAL" (ChronoGo WAL)
+	copy(buf[0:], []byte("CWAL"))
+
 	// 写入类型
-	buf[0] = entry.Type
+	buf[4] = entry.Type
 
 	// 写入数据库名长度
-	binary.LittleEndian.PutUint32(buf[1:], uint32(dbLen))
+	binary.LittleEndian.PutUint32(buf[5:], uint32(dbLen))
 
 	// 写入表名长度
-	binary.LittleEndian.PutUint32(buf[5:], uint32(tableLen))
+	binary.LittleEndian.PutUint32(buf[9:], uint32(tableLen))
 
 	// 写入时间戳
-	binary.LittleEndian.PutUint64(buf[9:], uint64(entry.Timestamp))
+	binary.LittleEndian.PutUint64(buf[13:], uint64(entry.Timestamp))
 
 	// 写入数据长度
-	binary.LittleEndian.PutUint32(buf[17:], uint32(dataLen))
+	binary.LittleEndian.PutUint32(buf[21:], uint32(dataLen))
 
 	// 写入数据库名
-	copy(buf[21:], entry.Database)
+	copy(buf[25:], entry.Database)
 
 	// 写入表名
-	copy(buf[21+dbLen:], entry.Table)
+	copy(buf[25+dbLen:], entry.Table)
 
 	// 写入数据
-	copy(buf[21+dbLen+tableLen:], entry.Data)
+	copy(buf[25+dbLen+tableLen:], entry.Data)
+
+	// 计算并写入CRC校验
+	crc := crc32.ChecksumIEEE(buf[:totalLen-4])
+	binary.LittleEndian.PutUint32(buf[totalLen-4:], crc)
 
 	return buf, nil
 }
@@ -336,12 +350,23 @@ func (w *WAL) Recover() ([]*WALEntry, error) {
 
 	// 恢复所有文件
 	var allEntries []*WALEntry
+	var failedFiles int
+
 	for _, file := range files {
 		entries, err := w.recoverFile(file)
 		if err != nil {
-			return nil, fmt.Errorf("failed to recover from file %s: %w", file, err)
+			// 记录错误但继续处理其他文件
+			failedFiles++
+			logger.Printf("WAL恢复警告: 从文件 %s 恢复失败: %v", file, err)
+			continue
 		}
 		allEntries = append(allEntries, entries...)
+	}
+
+	if failedFiles > 0 {
+		logger.Printf("WAL恢复: 完成恢复，共处理 %d 个文件，其中 %d 个文件恢复失败", len(files), failedFiles)
+	} else {
+		logger.Printf("WAL恢复: 成功恢复 %d 个文件中的 %d 个条目", len(files), len(allEntries))
 	}
 
 	return allEntries, nil
@@ -358,15 +383,81 @@ func (w *WAL) recoverFile(filePath string) ([]*WALEntry, error) {
 
 	// 读取所有条目
 	var entries []*WALEntry
+	var corruptedEntries int
+
 	for {
 		entry, err := w.readEntry(file)
 		if err != nil {
 			if err == io.EOF {
 				break
 			}
-			return nil, fmt.Errorf("failed to read WAL entry: %w", err)
+
+			// 记录损坏的条目数量
+			corruptedEntries++
+			logger.Printf("WAL恢复警告: 文件 %s 中发现损坏的条目: %v", filePath, err)
+
+			// 尝试跳过这个损坏的条目
+			// 我们将尝试向前移动文件指针，寻找下一个有效的条目
+			_, err = file.Seek(0, io.SeekCurrent)
+			if err != nil {
+				return entries, fmt.Errorf("failed to get current file position: %w", err)
+			}
+
+			// 尝试向前移动一个字节，然后继续读取
+			_, err = file.Seek(1, io.SeekCurrent)
+			if err != nil {
+				// 如果无法继续，返回已恢复的条目
+				logger.Printf("WAL恢复: 无法继续从文件 %s 恢复，已恢复 %d 个条目，跳过 %d 个损坏的条目",
+					filePath, len(entries), corruptedEntries)
+				return entries, nil
+			}
+
+			// 尝试寻找下一个魔数
+			found := false
+			buf := make([]byte, 1)
+			magicBuf := make([]byte, 4)
+			copy(magicBuf, []byte("CWA")) // 已经读取了3个字节
+
+			for {
+				n, err := file.Read(buf)
+				if err != nil || n == 0 {
+					break
+				}
+
+				// 移动魔数缓冲区
+				magicBuf[0] = magicBuf[1]
+				magicBuf[1] = magicBuf[2]
+				magicBuf[2] = magicBuf[3]
+				magicBuf[3] = buf[0]
+
+				// 检查是否找到魔数
+				if bytes.Equal(magicBuf, []byte("CWAL")) {
+					// 找到魔数，回退4个字节，使readEntry可以正确读取
+					_, err = file.Seek(-4, io.SeekCurrent)
+					if err == nil {
+						found = true
+						break
+					}
+				}
+			}
+
+			if !found {
+				// 如果无法找到下一个有效条目，返回已恢复的条目
+				logger.Printf("WAL恢复: 无法在文件 %s 中找到下一个有效条目，已恢复 %d 个条目，跳过 %d 个损坏的条目",
+					filePath, len(entries), corruptedEntries)
+				return entries, nil
+			}
+
+			// 继续尝试读取下一个条目
+			continue
 		}
+
 		entries = append(entries, entry)
+	}
+
+	if corruptedEntries > 0 {
+		logger.Printf("WAL恢复: 文件 %s 恢复完成，共恢复 %d 个条目，跳过 %d 个损坏的条目",
+			filePath, len(entries), corruptedEntries)
 	}
 
 	return entries, nil
@@ -374,6 +465,17 @@ func (w *WAL) recoverFile(filePath string) ([]*WALEntry, error) {
 
 // readEntry 从文件读取单个WAL条目
 func (w *WAL) readEntry(file *os.File) (*WALEntry, error) {
+	// 读取魔数
+	magicBuf := make([]byte, 4)
+	if _, err := io.ReadFull(file, magicBuf); err != nil {
+		return nil, err
+	}
+
+	// 验证魔数
+	if !bytes.Equal(magicBuf, []byte("CWAL")) {
+		return nil, fmt.Errorf("invalid WAL entry magic number")
+	}
+
 	// 读取类型
 	typeBuf := make([]byte, 1)
 	if _, err := io.ReadFull(file, typeBuf); err != nil {
@@ -443,6 +545,31 @@ func (w *WAL) readEntry(file *os.File) (*WALEntry, error) {
 		}
 	} else {
 		entry.Data = entry.Data[:0]
+	}
+
+	// 读取CRC校验
+	crcBuf := make([]byte, 4)
+	if _, err := io.ReadFull(file, crcBuf); err != nil {
+		w.entryPool.Put(entry)
+		return nil, err
+	}
+	storedCRC := binary.LittleEndian.Uint32(crcBuf)
+
+	// 计算条目的CRC
+	// 重新构建条目的字节表示，不包括CRC部分
+	entryBytes, err := w.serializeEntry(entry)
+	if err != nil {
+		w.entryPool.Put(entry)
+		return nil, fmt.Errorf("failed to serialize entry for CRC check: %w", err)
+	}
+
+	// 计算CRC，不包括最后4个字节（CRC本身）
+	calculatedCRC := crc32.ChecksumIEEE(entryBytes[:len(entryBytes)-4])
+
+	// 验证CRC
+	if calculatedCRC != storedCRC {
+		w.entryPool.Put(entry)
+		return nil, fmt.Errorf("CRC check failed: stored=%d, calculated=%d", storedCRC, calculatedCRC)
 	}
 
 	return entry, nil

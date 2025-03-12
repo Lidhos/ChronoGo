@@ -2120,7 +2120,7 @@ func (w *SSTableWriter) writeFooter(indexOffset, indexSize int64, filterOffset, 
 	binary.LittleEndian.PutUint32(footer[40:44], sstableMagicNumber)
 
 	// 写入校验和
-	checksum := crc32(footer[:44])
+	checksum := calculateCRC32(footer[:44])
 	binary.LittleEndian.PutUint32(footer[44:48], checksum)
 
 	// 写入页脚
@@ -2482,8 +2482,8 @@ func murmur3(data []byte) uint32 {
 	return hash
 }
 
-// crc32 计算 CRC32 校验和
-func crc32(data []byte) uint32 {
+// calculateCRC32 计算 CRC32 校验和
+func calculateCRC32(data []byte) uint32 {
 	var crc uint32 = 0xffffffff
 	for _, b := range data {
 		crc ^= uint32(b)

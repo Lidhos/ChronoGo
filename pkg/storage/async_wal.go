@@ -154,22 +154,45 @@ func (aw *AsyncWAL) Sync() error {
 
 // Close 关闭异步WAL
 func (aw *AsyncWAL) Close() error {
+	logger.Printf("AsyncWAL: 开始关闭")
+
 	// 取消上下文
 	aw.cancel()
 
 	// 等待所有工作线程退出
-	aw.wg.Wait()
+	done := make(chan struct{})
+	go func() {
+		aw.wg.Wait()
+		close(done)
+	}()
+
+	// 等待工作线程退出，最多等待5秒
+	select {
+	case <-done:
+		logger.Printf("AsyncWAL: 所有工作线程已退出")
+	case <-time.After(5 * time.Second):
+		logger.Printf("AsyncWAL: 等待工作线程退出超时")
+	}
 
 	// 刷新剩余条目
 	aw.mu.Lock()
-	if err := aw.flushBuffer(); err != nil {
-		aw.mu.Unlock()
-		return err
+	entriesCount := len(aw.buffer)
+	if entriesCount > 0 {
+		logger.Printf("AsyncWAL: 关闭前刷新剩余 %d 个条目", entriesCount)
+		if err := aw.flushBuffer(); err != nil {
+			aw.mu.Unlock()
+			return fmt.Errorf("failed to flush buffer during close: %w", err)
+		}
 	}
 	aw.mu.Unlock()
 
-	// 关闭底层WAL
-	return aw.wal.Close()
+	// 确保数据已写入磁盘
+	if err := aw.wal.Sync(); err != nil {
+		return fmt.Errorf("failed to sync WAL during close: %w", err)
+	}
+
+	logger.Printf("AsyncWAL: 关闭完成")
+	return nil
 }
 
 // Recover 从WAL恢复
