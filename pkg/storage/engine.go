@@ -2453,38 +2453,96 @@ func (e *StorageEngine) InsertPoints(dbName, tableName string, points []*model.T
 	return e.InsertPointsSync(dbName, tableName, points)
 }
 
-// InsertPointsSync 同步批量插入时序数据点
+// InsertPointsSync 同步插入多个数据点
 func (e *StorageEngine) InsertPointsSync(dbName, tableName string, points []*model.TimeSeriesPoint) error {
-	if len(points) == 0 {
-		return nil
-	}
-
-	// 获取表写锁
-	unlock := e.lockManager.LockTable(dbName, tableName, true)
-	defer unlock()
-
-	// 检查数据库和表是否存在
+	// 获取数据库
+	e.mu.RLock()
 	db, dbExists := e.databases[dbName]
+	e.mu.RUnlock()
+
 	if !dbExists {
 		return fmt.Errorf("database %s does not exist", dbName)
 	}
 
+	// 获取表
+	e.mu.RLock()
 	table, tableExists := db.Tables[tableName]
+	e.mu.RUnlock()
+
 	if !tableExists {
 		return fmt.Errorf("table %s does not exist in database %s", tableName, dbName)
 	}
 
-	// 获取内存表
-	memTable, err := e.getOrCreateMemTable(dbName, tableName)
-	if err != nil {
-		return fmt.Errorf("failed to get memtable: %w", err)
+	// 获取或创建内存表
+	key := dbName + ":" + tableName
+	e.mu.Lock()
+	memTable, exists := e.memTables[key]
+	if !exists {
+		// 创建新的内存表
+		memTable = NewMemTable(64 * 1024 * 1024) // 64MB
+		e.memTables[key] = memTable
+	}
+	e.mu.Unlock()
+
+	// 预分配足够大小的缓冲区，减少内存重新分配
+	docBuffers := make([][]byte, len(points))
+
+	// 并行序列化数据点
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var serializationErr error
+
+	// 使用工作池限制并发数
+	workerCount := runtime.NumCPU()
+	if workerCount > 4 {
+		workerCount = 4 // 最多4个工作线程
 	}
 
-	// 预先生成所有点的seriesID
-	// seriesIDs := make([]string, len(points))
+	// 创建工作通道
+	type workItem struct {
+		index int
+		point *model.TimeSeriesPoint
+	}
+	workChan := make(chan workItem, len(points))
 
-	// 创建WAL条目并插入数据点
-	for _, point := range points {
+	// 提交工作
+	for i, point := range points {
+		workChan <- workItem{index: i, point: point}
+	}
+	close(workChan)
+
+	// 启动工作线程
+	wg.Add(workerCount)
+	for i := 0; i < workerCount; i++ {
+		go func() {
+			defer wg.Done()
+
+			for work := range workChan {
+				// 使用 MarshalBSON 方法，它内部使用对象池
+				data, err := work.point.MarshalBSON()
+				if err != nil {
+					mu.Lock()
+					serializationErr = err
+					mu.Unlock()
+					continue
+				}
+
+				mu.Lock()
+				docBuffers[work.index] = data
+				mu.Unlock()
+			}
+		}()
+	}
+
+	// 等待所有序列化完成
+	wg.Wait()
+
+	// 检查序列化错误
+	if serializationErr != nil {
+		return serializationErr
+	}
+
+	for i, point := range points {
 		// 写入WAL
 		if e.wal != nil {
 			// 创建WAL条目
@@ -2495,13 +2553,8 @@ func (e *StorageEngine) InsertPointsSync(dbName, tableName string, points []*mod
 				Timestamp: point.Timestamp,
 			}
 
-			// 将数据点转换为BSON并序列化
-			doc := point.ToBSON()
-			data, err := bson.Marshal(doc)
-			if err != nil {
-				return err
-			}
-			entry.Data = data
+			// 使用已序列化的数据
+			entry.Data = docBuffers[i]
 
 			if e.asyncWAL != nil {
 				e.asyncWAL.Write(entry)
@@ -2515,18 +2568,8 @@ func (e *StorageEngine) InsertPointsSync(dbName, tableName string, points []*mod
 		// 写入内存表
 		e.mu.Lock()
 
-		// 将数据点转换为BSON
-		doc := point.ToBSON()
-
-		// 序列化为二进制
-		data, err := bson.Marshal(doc)
-		if err != nil {
-			e.mu.Unlock()
-			return err
-		}
-
-		// 插入跳表
-		memTable.data.Insert(point.Timestamp, data)
+		// 使用已序列化的数据
+		memTable.data.Insert(point.Timestamp, docBuffers[i])
 
 		// 更新大小
 		memTable.size++

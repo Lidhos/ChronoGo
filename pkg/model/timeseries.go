@@ -6,6 +6,8 @@ import (
 	"sync"
 	"time"
 
+	"ChronoGo/pkg/util"
+
 	"go.mongodb.org/mongo-driver/bson"
 )
 
@@ -110,6 +112,42 @@ func (p *TimeSeriesPoint) ToBSON() bson.D {
 	}
 
 	return doc
+}
+
+// ToBSONWithPool 将TimeSeriesPoint转换为BSON文档，使用对象池减少内存分配
+func (p *TimeSeriesPoint) ToBSONWithPool() *bson.D {
+	// 从对象池获取文档
+	doc := util.GetBSONDoc()
+
+	// 添加时间戳
+	*doc = append(*doc, bson.E{Key: "timestamp", Value: p.Timestamp})
+
+	// 添加标签
+	if len(p.Tags) > 0 {
+		// 创建标签文档
+		tags := bson.D{}
+		for k, v := range p.Tags {
+			tags = append(tags, bson.E{Key: k, Value: v})
+		}
+		*doc = append(*doc, bson.E{Key: "tags", Value: tags})
+	}
+
+	// 添加字段
+	for k, v := range p.Fields {
+		*doc = append(*doc, bson.E{Key: k, Value: v})
+	}
+
+	return doc
+}
+
+// MarshalBSON 将TimeSeriesPoint序列化为BSON字节数组，使用对象池减少内存分配
+func (p *TimeSeriesPoint) MarshalBSON() ([]byte, error) {
+	// 使用对象池获取文档
+	doc := p.ToBSONWithPool()
+	defer util.PutBSONDoc(doc)
+
+	// 序列化文档
+	return util.MarshalWithPool(doc)
 }
 
 // FromBSON 从BSON文档创建时序数据点

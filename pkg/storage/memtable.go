@@ -2,6 +2,7 @@ package storage
 
 import (
 	"encoding/json"
+	"runtime"
 	"sync"
 	"time"
 
@@ -68,80 +69,72 @@ func (mt *MemTable) PutBatch(points []*model.TimeSeriesPoint) error {
 		return nil
 	}
 
-	// 如果只有一个点，使用单点插入
-	if len(points) == 1 {
-		return mt.Put(points[0])
-	}
-
 	mt.mu.Lock()
 	defer mt.mu.Unlock()
 
-	// 预分配足够的容量
-	// 估计每个标签索引的平均大小
-	tagKeyCount := make(map[string]int)
-	tagValueCount := make(map[string]map[string]int)
+	// 预分配足够大小的缓冲区，减少内存重新分配
+	docBuffers := make([][]byte, len(points))
 
-	// 批量处理所有数据点
-	for _, point := range points {
-		// 将数据点转换为BSON
-		doc := point.ToBSON()
+	// 并行序列化数据点
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var serializationErr error
 
-		// 序列化为二进制
-		data, err := bson.Marshal(doc)
-		if err != nil {
-			return err
-		}
-
-		// 插入跳表
-		mt.data.Insert(point.Timestamp, data)
-
-		// 统计标签
-		for tagKey, tagValue := range point.Tags {
-			if _, exists := tagKeyCount[tagKey]; !exists {
-				tagKeyCount[tagKey] = 0
-				tagValueCount[tagKey] = make(map[string]int)
-			}
-			tagKeyCount[tagKey]++
-
-			if _, exists := tagValueCount[tagKey][tagValue]; !exists {
-				tagValueCount[tagKey][tagValue] = 0
-			}
-			tagValueCount[tagKey][tagValue]++
-		}
-
-		// 更新大小
-		mt.size += int64(len(data))
+	// 使用工作池限制并发数
+	workerCount := runtime.NumCPU()
+	if workerCount > 4 {
+		workerCount = 4 // 最多4个工作线程
 	}
 
-	// 预分配标签索引空间
-	for tagKey, _ := range tagKeyCount {
-		if _, exists := mt.tagIndexes[tagKey]; !exists {
-			mt.tagIndexes[tagKey] = make(map[string][]int64)
-		}
+	// 创建工作通道
+	type workItem struct {
+		index int
+		point *model.TimeSeriesPoint
+	}
+	workChan := make(chan workItem, len(points))
 
-		// 预分配每个标签值的时间戳数组
-		for tagValue, valueCount := range tagValueCount[tagKey] {
-			if _, exists := mt.tagIndexes[tagKey][tagValue]; !exists {
-				// 新建标签值索引
-				mt.tagIndexes[tagKey][tagValue] = make([]int64, 0, valueCount)
-			} else {
-				// 扩展现有标签值索引
-				currentLen := len(mt.tagIndexes[tagKey][tagValue])
-				if cap(mt.tagIndexes[tagKey][tagValue])-currentLen < valueCount {
-					// 需要扩容
-					newSlice := make([]int64, currentLen, currentLen+valueCount)
-					copy(newSlice, mt.tagIndexes[tagKey][tagValue])
-					mt.tagIndexes[tagKey][tagValue] = newSlice
+	// 提交工作
+	for i, point := range points {
+		workChan <- workItem{index: i, point: point}
+	}
+	close(workChan)
+
+	// 启动工作线程
+	wg.Add(workerCount)
+	for i := 0; i < workerCount; i++ {
+		go func() {
+			defer wg.Done()
+
+			for work := range workChan {
+				// 使用 MarshalBSON 方法，它内部使用对象池
+				data, err := work.point.MarshalBSON()
+				if err != nil {
+					mu.Lock()
+					serializationErr = err
+					mu.Unlock()
+					continue
 				}
+
+				mu.Lock()
+				docBuffers[work.index] = data
+				mu.Unlock()
 			}
-		}
+		}()
 	}
 
-	// 批量更新标签索引
-	for _, point := range points {
-		for tagKey, tagValue := range point.Tags {
-			mt.tagIndexes[tagKey][tagValue] = append(mt.tagIndexes[tagKey][tagValue], point.Timestamp)
-		}
+	// 等待所有序列化完成
+	wg.Wait()
+
+	// 检查序列化错误
+	if serializationErr != nil {
+		return serializationErr
+	}
+
+	// 批量插入数据
+	for i, point := range points {
+		// 插入跳表
+		mt.data.Insert(point.Timestamp, docBuffers[i])
+		mt.size++
 	}
 
 	return nil

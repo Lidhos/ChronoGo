@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"sort"
@@ -23,6 +24,7 @@ import (
 	"ChronoGo/pkg/protocol"
 	"ChronoGo/pkg/query"
 	"ChronoGo/pkg/storage"
+	_ "net/http/pprof" // 导入 pprof
 )
 
 var (
@@ -116,6 +118,15 @@ func main() {
 		// 注册集群命令
 		registerClusterCommands(commandHandler, clusterManager)
 	}
+
+	// 启动 pprof HTTP 服务器
+	go func() {
+		logger.Printf("启动 pprof 服务器，监听端口 :6060")
+		err := http.ListenAndServe(":6060", nil)
+		if err != nil {
+			logger.Printf("pprof 服务器启动失败: %v", err)
+		}
+	}()
 
 	// 打印启动信息
 	log.Printf("ChronoGo started")

@@ -233,6 +233,42 @@ ChronoGo目前处于早期开发阶段，基本功能已经实现，但仍有许
 - 自动负载均衡
 - 数据迁移工具
 
+## 性能测试工具
+
+ChronoGo 提供了专门的性能测试和分析工具，帮助用户评估系统性能并识别潜在的性能瓶颈。
+
+### 使用方法
+
+```bash
+# 编译性能测试工具
+cd cmd/benchmark
+go build -o chronogo_benchmark
+
+# 运行性能测试
+./chronogo_benchmark -test all -duration 30 -parallel 4 -batchsize 100 -cpuprofile profiles/cpu.prof -memprofile profiles/mem.prof
+```
+
+### 测试选项
+
+- `-test`: 测试类型，可选 single（单点写入）、batch（批量写入）或 all（全部）
+- `-duration`: 测试持续时间（秒）
+- `-parallel`: 并行客户端数量
+- `-batchsize`: 批量写入的批次大小
+- `-cpuprofile`: CPU 性能分析文件路径
+- `-memprofile`: 内存性能分析文件路径
+- `-blockprofile`: 阻塞性能分析文件路径
+- `-server`: ChronoGo 服务器地址，默认 localhost:27017
+
+### 性能分析
+
+使用 Go 的 pprof 工具分析性能数据：
+
+```bash
+go tool pprof -http=:8080 profiles/cpu.prof
+```
+
+更多详细信息，请参阅 [性能测试与分析指南](cmd/benchmark/PERFORMANCE_GUIDE.md)。
+
 ## 贡献
 
 欢迎贡献代码、报告问题或提出建议。请通过GitHub Issues或Pull Requests参与项目开发。

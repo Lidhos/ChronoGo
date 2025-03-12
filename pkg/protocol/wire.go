@@ -16,6 +16,7 @@ import (
 
 	"ChronoGo/pkg/logger"
 	"ChronoGo/pkg/query"
+	"ChronoGo/pkg/util"
 )
 
 // MongoDB操作码
@@ -950,7 +951,7 @@ func (h *WireProtocolHandler) sendOpMsg(session *Session, responseTo int32, docu
 	logger.Printf("sendOpMsg: 开始发送响应 (ResponseTo: %d)", responseTo)
 
 	// 序列化文档
-	docBytes, err := bson.Marshal(document)
+	docBytes, err := util.MarshalWithPool(document)
 	if err != nil {
 		logger.Printf("sendOpMsg: 序列化文档失败: %v", err)
 		return err
@@ -1017,23 +1018,42 @@ func splitNamespace(namespace string) []string {
 	return []string{namespace}
 }
 
-// getBsonValue 从BSON文档中获取值
 // sendReply 发送响应
 func (h *WireProtocolHandler) sendReply(session *Session, responseTo int32, documents []bson.D, flags int32, cursorID int64) error {
 	logger.Printf("sendReply: 开始发送响应 (ResponseTo: %d, 文档数: %d, 标志位: %d, 游标ID: %d)",
 		responseTo, len(documents), flags, cursorID)
 
-	// 序列化文档
-	docBytes := make([]byte, 0)
+	// 预分配足够大小的缓冲区
+	totalSize := 0
+	docSizes := make([]int, len(documents))
+
+	// 第一次遍历，计算总大小
 	for i, doc := range documents {
-		b, err := bson.Marshal(doc)
+		// 使用对象池序列化文档
+		b, err := util.MarshalWithPool(doc)
+		if err != nil {
+			logger.Printf("sendReply: 序列化文档 #%d 失败: %v", i, err)
+			return fmt.Errorf("failed to marshal document: %w", err)
+		}
+		docSizes[i] = len(b)
+		totalSize += len(b)
+		logger.Printf("sendReply: 文档 #%d 序列化成功，大小: %d 字节", i, len(b))
+	}
+
+	// 创建足够大的缓冲区
+	docBytes := make([]byte, 0, totalSize)
+
+	// 第二次遍历，序列化并追加到缓冲区
+	for i, doc := range documents {
+		// 使用对象池序列化文档
+		b, err := util.MarshalWithPool(doc)
 		if err != nil {
 			logger.Printf("sendReply: 序列化文档 #%d 失败: %v", i, err)
 			return fmt.Errorf("failed to marshal document: %w", err)
 		}
 		docBytes = append(docBytes, b...)
-		logger.Printf("sendReply: 文档 #%d 序列化成功，大小: %d 字节", i, len(b))
 	}
+
 	logger.Printf("sendReply: 所有文档序列化完成，总大小: %d 字节", len(docBytes))
 
 	// 计算消息长度
